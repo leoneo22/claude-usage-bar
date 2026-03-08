@@ -1,0 +1,10 @@
+.build/
+*.xcodeproj
+*.xcworkspace
+.swiftpm/
+DerivedData/
+*.o
+*.d
+.DS_Store
+ClaudeUsageBar.app/
+BUILD_LOG.md
