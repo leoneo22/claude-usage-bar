@@ -48,7 +48,7 @@ If not, run `claude` in Terminal and complete the login flow first.
 ### 2. Clone and build
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/claude-usage-bar.git
+git clone https://github.com/leoneo22/claude-usage-bar.git
 cd claude-usage-bar
 bash scripts/bundle-app.sh
 ```
