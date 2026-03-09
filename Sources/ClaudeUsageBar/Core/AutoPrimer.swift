@@ -39,12 +39,16 @@ final class AutoPrimer: ObservableObject {
         defer { lastKnownResetsAt = resetsAt }
 
         guard isEnabled else { return }
-
-        // Detect reset: resetsAt moved to a later date
-        guard let last = lastKnownResetsAt, resetsAt > last else { return }
-
-        // New reset detected — schedule primer in 55 min (unless we're already priming)
         guard primeTask == nil else { return }
+
+        if let last = lastKnownResetsAt {
+            // Subsequent polls: detect reset (resetsAt moved to a later date)
+            guard resetsAt > last else { return }
+        } else {
+            // First poll after launch: if window looks idle, prime it
+            guard window.utilization < idleThreshold else { return }
+        }
+
         schedulePriming()
     }
 
