@@ -15,10 +15,12 @@ final class AutoPrimer: ObservableObject {
     @Published private(set) var nextPrimeDate: Date?
     @Published private(set) var lastPrimed: Date?
 
-    // MARK: - Callback
+    // MARK: - Callbacks
 
     /// Called immediately after a successful primer send.
     var onPrimed: (() async -> Void)?
+    /// Provides the current access token without hitting Keychain.
+    var tokenProvider: (() throws -> String)?
 
     // MARK: - Private
 
@@ -76,12 +78,10 @@ final class AutoPrimer: ObservableObject {
     // MARK: - Fire
 
     private func fireIfIdle() async {
-        // Re-read Keychain for fresh token (55 min have elapsed)
-        guard let creds = try? KeychainManager.readClaudeCredentials(),
-              !creds.isExpired else { return }
+        guard let token = try? tokenProvider?() else { return }
 
         do {
-            try await sendPrimeMessage(using: creds.accessToken)
+            try await sendPrimeMessage(using: token)
             lastPrimed = Date()
             nextPrimeDate = nil
             primeTask = nil

@@ -23,6 +23,11 @@ final class OAuthUsageProvider: ObservableObject {
     private let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     private let poller = UsagePoller()
 
+    /// Cached token to avoid hitting Keychain every poll cycle.
+    /// Re-read only on startup, expiry, or 401.
+    private var cachedToken: String?
+    private var cachedTokenExpiry: Date?
+
     /// Exposed so the popup view can observe and toggle primer state.
     let autoPrimer = AutoPrimer()
 
@@ -31,19 +36,26 @@ final class OAuthUsageProvider: ObservableObject {
     init() {
         poller.onPoll = { [weak self] in await self?.poll() }
         autoPrimer.onPrimed = { [weak self] in self?.pollNow() }
+        autoPrimer.tokenProvider = { [weak self] in
+            guard let self else { throw UsageError.authExpired }
+            return try self.getToken()
+        }
     }
 
     // MARK: - UsageProvider conformance
 
     func poll() async {
         do {
-            let creds = try KeychainManager.readClaudeCredentials()
-            let response = try await fetchUsage(using: creds.accessToken)
+            let token = try getToken()
+            let response = try await fetchUsage(using: token)
             applyResponse(response)
             poller.lastPollError = nil
         } catch UsageError.authExpired {
-            // 401: give Claude Code a moment to refresh the token, then retry once
+            // 401: invalidate cache, give Claude Code a moment to refresh, retry once
+            invalidateTokenCache()
             if let fresh = try? await TokenRefresher.waitForTokenRefresh() {
+                cachedToken = fresh.accessToken
+                cachedTokenExpiry = fresh.expiresAt
                 do {
                     let response = try await fetchUsage(using: fresh.accessToken)
                     applyResponse(response)
@@ -95,6 +107,27 @@ final class OAuthUsageProvider: ObservableObject {
     private func setError(_ e: UsageError) {
         error = e
         poller.lastPollError = e
+    }
+
+    // MARK: - Token cache
+
+    /// Returns a cached token or reads a fresh one from Keychain.
+    /// Only touches Keychain on first call, after expiry, or after invalidation.
+    private func getToken() throws -> String {
+        if let token = cachedToken,
+           let expiry = cachedTokenExpiry,
+           expiry > Date() {
+            return token
+        }
+        let creds = try KeychainManager.readClaudeCredentials()
+        cachedToken = creds.accessToken
+        cachedTokenExpiry = creds.expiresAt
+        return creds.accessToken
+    }
+
+    private func invalidateTokenCache() {
+        cachedToken = nil
+        cachedTokenExpiry = nil
     }
 
     // MARK: - Network
