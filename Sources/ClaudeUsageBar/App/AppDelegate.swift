@@ -103,8 +103,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .receive(on: RunLoop.main)
             .sink { [weak self] error in
                 guard error != nil else { return }
-                if case .authExpired = error {
+                switch error {
+                case .authExpired, .keychainDenied:
                     self?.statusItem?.button?.title = "⚡ ⚠"
+                default:
+                    break
                 }
             }
             .store(in: &cancellables)

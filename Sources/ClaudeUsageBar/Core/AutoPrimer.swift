@@ -78,16 +78,32 @@ final class AutoPrimer: ObservableObject {
     // MARK: - Fire
 
     private func fireIfIdle() async {
-        guard let token = try? tokenProvider?() else { return }
+        // Try to get a token — if expired, attempt a refresh via CLI
+        var token: String?
+        token = try? tokenProvider?()
+        if token == nil {
+            NSLog("[ClaudeUsageBar] AutoPrimer: token expired, attempting refresh before priming")
+            if let fresh = try? await TokenRefresher.waitForTokenRefresh() {
+                token = fresh.accessToken
+            }
+        }
+
+        guard let token else {
+            NSLog("[ClaudeUsageBar] AutoPrimer: no valid token available — skipping prime")
+            primeTask = nil
+            nextPrimeDate = nil
+            return
+        }
 
         do {
             try await sendPrimeMessage(using: token)
             lastPrimed = Date()
             nextPrimeDate = nil
             primeTask = nil
+            NSLog("[ClaudeUsageBar] AutoPrimer: successfully primed window")
             await onPrimed?()
         } catch {
-            // Primer failure is non-critical — reset state silently
+            NSLog("[ClaudeUsageBar] AutoPrimer: prime failed — %@", error.localizedDescription)
             primeTask = nil
             nextPrimeDate = nil
         }

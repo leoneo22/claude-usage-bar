@@ -44,6 +44,9 @@ final class OAuthUsageProvider: ObservableObject {
 
     // MARK: - UsageProvider conformance
 
+    /// Maximum number of token-refresh retries before giving up on a single poll cycle.
+    private static let maxRefreshRetries = 2
+
     func poll() async {
         do {
             let token = try getToken()
@@ -51,30 +54,66 @@ final class OAuthUsageProvider: ObservableObject {
             applyResponse(response)
             poller.lastPollError = nil
         } catch UsageError.authExpired {
-            // 401: invalidate cache, give Claude Code a moment to refresh, retry once
-            invalidateTokenCache()
-            if let fresh = try? await TokenRefresher.waitForTokenRefresh() {
-                cachedToken = fresh.accessToken
-                cachedTokenExpiry = fresh.expiresAt
-                do {
-                    let response = try await fetchUsage(using: fresh.accessToken)
-                    applyResponse(response)
-                    poller.lastPollError = nil
-                    return
-                } catch let e as UsageError {
-                    setError(e); return
-                } catch {
-                    setError(.networkError(error.localizedDescription)); return
-                }
-            }
-            setError(.authExpired)
+            // 401 or expired token: invalidate cache and attempt refresh
+            await handleAuthExpired()
+        } catch let e as KeychainError where e.isAccessDenied {
+            // User denied Keychain access or it's locked — do NOT retry automatically.
+            // Retrying would immediately pop another password dialog.
+            NSLog("[ClaudeUsageBar] Keychain access denied — backing off to avoid repeated prompts")
+            setError(.keychainDenied)
+        } catch let e as KeychainError {
+            // Other Keychain errors (not found, bad data) — try refresh flow
+            NSLog("[ClaudeUsageBar] Keychain error: %@", e.localizedDescription)
+            await handleAuthExpired()
         } catch let e as UsageError {
             setError(e)
-        } catch let e as KeychainError {
-            setError(.credentialError(e.localizedDescription))
         } catch {
             setError(.networkError(error.localizedDescription))
         }
+    }
+
+    /// Shared auth-recovery flow: invalidate cache, run CLI refresh, retry.
+    private func handleAuthExpired() async {
+        invalidateTokenCache()
+
+        for attempt in 1...Self.maxRefreshRetries {
+            NSLog("[ClaudeUsageBar] Token refresh attempt %d/%d", attempt, Self.maxRefreshRetries)
+
+            do {
+                guard let fresh = try await TokenRefresher.waitForTokenRefresh() else {
+                    // CLI ran but token is still expired
+                    if attempt < Self.maxRefreshRetries {
+                        try? await Task.sleep(for: .seconds(2))
+                    }
+                    continue
+                }
+                cachedToken = fresh.accessToken
+                cachedTokenExpiry = fresh.expiresAt
+                let response = try await fetchUsage(using: fresh.accessToken)
+                applyResponse(response)
+                poller.lastPollError = nil
+                NSLog("[ClaudeUsageBar] Token refresh succeeded on attempt %d", attempt)
+                return
+            } catch let e as KeychainError where e.isAccessDenied {
+                // Keychain prompted and user denied — stop immediately, don't re-prompt
+                NSLog("[ClaudeUsageBar] Keychain denied during refresh — aborting retries")
+                setError(.keychainDenied)
+                return
+            } catch UsageError.authExpired {
+                // Token was refreshed but API still rejected — try again
+                invalidateTokenCache()
+                if attempt < Self.maxRefreshRetries {
+                    try? await Task.sleep(for: .seconds(2))
+                }
+                continue
+            } catch let e as UsageError {
+                setError(e); return
+            } catch {
+                setError(.networkError(error.localizedDescription)); return
+            }
+        }
+
+        setError(.authExpired)
     }
 
     func startPolling() {
@@ -86,7 +125,22 @@ final class OAuthUsageProvider: ObservableObject {
     }
 
     /// Cancels the current sleep and polls immediately (e.g. "Poll Now" menu item).
+    /// This is user-triggered, so we allow Keychain UI prompts (one-time password dialog).
     func pollNow() {
+        // If we're in a keychainDenied state, try a UI-allowed read first.
+        // This is the only code path that shows a Keychain password dialog.
+        if case .keychainDenied = error {
+            do {
+                let creds = try KeychainManager.readClaudeCredentials(allowUI: true)
+                if !creds.isExpired {
+                    cachedToken = creds.accessToken
+                    cachedTokenExpiry = creds.expiresAt
+                    error = nil
+                }
+            } catch {
+                // User denied again or other error — the poll will handle it
+            }
+        }
         poller.pollImmediately()
     }
 
@@ -113,13 +167,24 @@ final class OAuthUsageProvider: ObservableObject {
 
     /// Returns a cached token or reads a fresh one from Keychain.
     /// Only touches Keychain on first call, after expiry, or after invalidation.
+    /// Uses silent Keychain reads (no password dialog) for background polls.
     private func getToken() throws -> String {
         if let token = cachedToken,
            let expiry = cachedTokenExpiry,
            expiry > Date() {
             return token
         }
-        let creds = try KeychainManager.readClaudeCredentials()
+        // allowUI: false → fail silently instead of showing a macOS password dialog.
+        // If the user hasn't granted "Always Allow", this will throw .accessDenied
+        // without interrupting the user. They can use "Poll Now" to trigger a read
+        // with UI allowed.
+        let creds = try KeychainManager.readClaudeCredentials(allowUI: false)
+        // If the Keychain token is already expired, throw immediately
+        // so the caller can trigger the refresh flow instead of making
+        // a doomed API call that returns 401.
+        guard !creds.isExpired else {
+            throw UsageError.authExpired
+        }
         cachedToken = creds.accessToken
         cachedTokenExpiry = creds.expiresAt
         return creds.accessToken

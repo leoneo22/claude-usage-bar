@@ -56,6 +56,7 @@ struct UsageResponse: Decodable, Sendable {
 
 enum UsageError: Error, LocalizedError, Sendable {
     case authExpired
+    case keychainDenied
     case rateLimited
     case httpError(Int)
     case networkError(String)
@@ -65,6 +66,8 @@ enum UsageError: Error, LocalizedError, Sendable {
         switch self {
         case .authExpired:
             return "Auth expired — re-authenticating…"
+        case .keychainDenied:
+            return "Keychain access denied — click \"Always Allow\" when prompted, or right-click → Poll Now"
         case .rateLimited:
             return "Rate limited (429) — backing off"
         case .httpError(let code):
@@ -84,6 +87,7 @@ extension UsageError: Equatable {
     static func == (lhs: UsageError, rhs: UsageError) -> Bool {
         switch (lhs, rhs) {
         case (.authExpired, .authExpired), (.rateLimited, .rateLimited): return true
+        case (.keychainDenied, .keychainDenied): return true
         case (.httpError(let a), .httpError(let b)): return a == b
         default: return false
         }

@@ -19,17 +19,19 @@ struct ErrorBannerView: View {
 
     private var bannerColor: Color {
         switch error {
-        case .authExpired: return .orange
-        case .rateLimited: return .yellow
-        default:           return .red
+        case .authExpired:    return .orange
+        case .keychainDenied: return .orange
+        case .rateLimited:    return .yellow
+        default:              return .red
         }
     }
 
     private var iconName: String {
         switch error {
-        case .authExpired: return "lock.fill"
-        case .rateLimited: return "clock.fill"
-        default:           return "exclamationmark.triangle.fill"
+        case .authExpired:    return "lock.fill"
+        case .keychainDenied: return "key.fill"
+        case .rateLimited:    return "clock.fill"
+        default:              return "exclamationmark.triangle.fill"
         }
     }
 }

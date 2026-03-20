@@ -3,10 +3,11 @@ import AppKit
 // MARK: - Polling intervals (seconds)
 
 private enum Interval {
-    static let normal:      Double = 60
-    static let afterError:  Double = 30
-    static let backoff:     Double = 300   // 5 min — after 3 consecutive errors
-    static let rateLimited: Double = 300   // 5 min
+    static let normal:         Double = 60
+    static let afterError:     Double = 30
+    static let backoff:        Double = 300   // 5 min — after 3 consecutive errors
+    static let rateLimited:    Double = 300   // 5 min
+    static let keychainDenied: Double = 600   // 10 min — don't spam password dialogs
 }
 
 // MARK: - UsagePoller
@@ -87,6 +88,10 @@ final class UsagePoller {
         switch lastPollError {
         case .rateLimited:
             return Interval.rateLimited
+        case .keychainDenied:
+            // User denied Keychain access — don't keep spamming password dialogs.
+            // Wait 10 min, or until the user manually triggers "Poll Now".
+            return Interval.keychainDenied
         case .some:
             return consecutiveErrors >= 3 ? Interval.backoff : Interval.afterError
         case .none:
