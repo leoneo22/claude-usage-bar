@@ -8,6 +8,13 @@ struct OAuthCredentials: Decodable, Sendable {
     /// Absolute expiry date (converted from ms or seconds as needed).
     let expiresAt: Date
 
+    /// Direct initializer for building credentials from a token refresh response.
+    init(accessToken: String, refreshToken: String, expiresAt: Date) {
+        self.accessToken = accessToken
+        self.refreshToken = refreshToken
+        self.expiresAt = expiresAt
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: AnyKey.self)
 

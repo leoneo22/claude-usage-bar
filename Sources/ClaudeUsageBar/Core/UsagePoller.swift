@@ -6,8 +6,10 @@ private enum Interval {
     static let normal:         Double = 60
     static let afterError:     Double = 30
     static let backoff:        Double = 300   // 5 min — after 3 consecutive errors
-    static let rateLimited:    Double = 300   // 5 min
+    static let rateLimited1st: Double = 30    // 30 sec — first 429 (usually transient after wake)
+    static let rateLimited:    Double = 120   // 2 min — subsequent 429s
     static let keychainDenied: Double = 600   // 10 min — don't spam password dialogs
+    static let afterWake:      Double = 5     // let network stack reconnect
 }
 
 // MARK: - UsagePoller
@@ -86,8 +88,13 @@ final class UsagePoller {
 
     private func nextInterval() -> Double {
         switch lastPollError {
-        case .rateLimited:
-            return Interval.rateLimited
+        case .rateLimited(let retryAfter):
+            // If the API told us exactly when to retry, respect it (capped at 10 min).
+            if let seconds = retryAfter, seconds > 0 {
+                return min(seconds, 600)
+            }
+            // No Retry-After header: first 429 retry quickly, then escalate.
+            return consecutiveErrors <= 1 ? Interval.rateLimited1st : Interval.rateLimited
         case .keychainDenied:
             // User denied Keychain access — don't keep spamming password dialogs.
             // Wait 10 min, or until the user manually triggers "Poll Now".
@@ -101,6 +108,12 @@ final class UsagePoller {
 
     // MARK: - Sleep/wake
 
+    /// Polls after wake with a brief delay to let Wi-Fi/DNS reconnect.
+    func pollAfterWake() {
+        pollingTask?.cancel()
+        scheduleLoop(delay: Interval.afterWake)
+    }
+
     private func setupWakeObserver() {
         wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didWakeNotification,
@@ -108,7 +121,8 @@ final class UsagePoller {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.pollImmediately()
+                NSLog("[ClaudeUsageBar] Wake detected — polling in %.0f seconds", Interval.afterWake)
+                self?.pollAfterWake()
             }
         }
     }

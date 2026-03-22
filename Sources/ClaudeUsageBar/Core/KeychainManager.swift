@@ -35,12 +35,12 @@ enum KeychainError: Error, LocalizedError {
 
 // MARK: - KeychainManager
 
-/// Stateless helper that reads Claude Code OAuth credentials from the macOS Keychain.
+/// Reads and writes Claude Code OAuth credentials in the macOS Keychain.
 ///
 /// Security notes:
 /// - Never caches tokens — each call reads from Keychain directly.
 /// - Never logs credential values.
-/// - Tokens must be read once, used immediately, then released.
+/// - Writes use the same format Claude Code expects (wrapped in "claudeAiOauth").
 enum KeychainManager {
     /// The service name written by Claude Code's `keytar` call.
     static let claudeCodeService = "Claude Code-credentials"
@@ -96,6 +96,65 @@ enum KeychainManager {
             return try JSONDecoder().decode(OAuthCredentials.self, from: data)
         } catch {
             throw KeychainError.unexpectedData(error.localizedDescription)
+        }
+    }
+
+    /// Writes refreshed credentials back to Keychain in the format Claude Code expects.
+    ///
+    /// Reads the existing blob first to preserve any extra fields (scopes, subscriptionType, etc.),
+    /// then updates only the token fields.
+    static func writeClaudeCredentials(_ creds: OAuthCredentials) throws {
+        // Read existing blob to preserve extra fields
+        let readQuery: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: claudeCodeService,
+            kSecReturnData:  kCFBooleanTrue as Any,
+            kSecMatchLimit:  kSecMatchLimitOne,
+        ]
+
+        var existingBlob: [String: Any] = [:]
+        var raw: AnyObject?
+        if SecItemCopyMatching(readQuery as CFDictionary, &raw) == errSecSuccess,
+           let data = raw as? Data,
+           let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let oauth = json["claudeAiOauth"] as? [String: Any] {
+            existingBlob = oauth
+        }
+
+        // Update token fields (store expiresAt as milliseconds, matching Claude Code's format)
+        existingBlob["accessToken"] = creds.accessToken
+        existingBlob["refreshToken"] = creds.refreshToken
+        existingBlob["expiresAt"] = creds.expiresAt.timeIntervalSince1970 * 1000
+
+        let wrapper: [String: Any] = ["claudeAiOauth": existingBlob]
+        let data = try JSONSerialization.data(withJSONObject: wrapper)
+
+        // Update existing item (or add if not found)
+        let updateQuery: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: claudeCodeService,
+        ]
+        let attrs: [CFString: Any] = [
+            kSecValueData: data,
+        ]
+
+        let status = SecItemUpdate(updateQuery as CFDictionary, attrs as CFDictionary)
+
+        switch status {
+        case errSecSuccess:
+            break
+        case errSecItemNotFound:
+            // Item doesn't exist yet — add it
+            var addQuery = updateQuery
+            addQuery[kSecValueData] = data
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            guard addStatus == errSecSuccess else {
+                throw KeychainError.osError(addStatus)
+            }
+        case errSecAuthFailed, errSecUserCanceled, errSecInteractionNotAllowed:
+            throw KeychainError.accessDenied
+        default:
+            throw KeychainError.osError(status)
         }
     }
 }

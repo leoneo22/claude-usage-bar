@@ -57,7 +57,8 @@ struct UsageResponse: Decodable, Sendable {
 enum UsageError: Error, LocalizedError, Sendable {
     case authExpired
     case keychainDenied
-    case rateLimited
+    /// Rate limited with optional Retry-After value (in seconds) from the API.
+    case rateLimited(retryAfter: Double?)
     case httpError(Int)
     case networkError(String)
     case credentialError(String)
@@ -68,8 +69,12 @@ enum UsageError: Error, LocalizedError, Sendable {
             return "Auth expired — re-authenticating…"
         case .keychainDenied:
             return "Keychain access denied — click \"Always Allow\" when prompted, or right-click → Poll Now"
-        case .rateLimited:
-            return "Rate limited (429) — backing off"
+        case .rateLimited(let retryAfter):
+            if let seconds = retryAfter {
+                let mins = Int(ceil(seconds / 60))
+                return "Rate limited — retrying in ~\(mins) min"
+            }
+            return "Rate limited (429) — retrying shortly"
         case .httpError(let code):
             return "HTTP \(code)"
         case .networkError(let msg):
@@ -81,13 +86,26 @@ enum UsageError: Error, LocalizedError, Sendable {
 
     /// Whether a token refresh should be attempted after this error.
     var shouldRefreshToken: Bool { self == .authExpired }
+
+    /// Whether this error is any kind of rate limit.
+    var isRateLimited: Bool {
+        if case .rateLimited = self { return true }
+        return false
+    }
+
+    /// The Retry-After value from a rate limit response, if available.
+    var retryAfterSeconds: Double? {
+        if case .rateLimited(let v) = self { return v }
+        return nil
+    }
 }
 
 extension UsageError: Equatable {
     static func == (lhs: UsageError, rhs: UsageError) -> Bool {
         switch (lhs, rhs) {
-        case (.authExpired, .authExpired), (.rateLimited, .rateLimited): return true
+        case (.authExpired, .authExpired): return true
         case (.keychainDenied, .keychainDenied): return true
+        case (.rateLimited, .rateLimited): return true
         case (.httpError(let a), .httpError(let b)): return a == b
         default: return false
         }

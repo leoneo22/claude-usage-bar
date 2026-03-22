@@ -1,7 +1,11 @@
 import Foundation
 
-/// Sends a tiny Haiku message 55 minutes after a 5-hour window resets (if idle),
-/// so the new window starts counting early rather than waiting for organic usage.
+/// Sends a tiny Haiku message shortly after the 5-hour window resets,
+/// so the new window starts counting immediately rather than waiting
+/// for the user's next organic usage.
+///
+/// Timing: fires 2 minutes after `resetsAt` (the window boundary).
+/// The countdown shown in the UI tracks the actual reset time.
 ///
 /// Cost: ~3 tokens per fire — negligible.
 @MainActor
@@ -25,47 +29,52 @@ final class AutoPrimer: ObservableObject {
     // MARK: - Private
 
     private let messagesURL = URL(string: "https://api.anthropic.com/v1/messages")!
-    private let delay: TimeInterval = 55 * 60   // 55 minutes
-    private let idleThreshold: Double = 2.0     // < 2% = considered idle
+    /// How long after the window resets before we fire the primer.
+    private let postResetDelay: TimeInterval = 120   // 2 minutes
 
     private var primeTask: Task<Void, Never>?
-    private var lastKnownResetsAt: Date?
+    /// The `resetsAt` date we're currently targeting. Used to avoid rescheduling
+    /// on every poll when the target hasn't changed.
+    private var targetResetDate: Date?
 
     // MARK: - Public API
 
     /// Called by OAuthUsageProvider after each successful poll.
-    /// Detects window resets and schedules a primer if the window was reset.
+    /// Schedules (or updates) the primer to fire shortly after the window resets.
     func handleUpdate(_ window: UsageWindow) {
+        guard isEnabled else { return }
         guard let resetsAt = window.resetsAt else { return }
 
-        defer { lastKnownResetsAt = resetsAt }
-
-        guard isEnabled else { return }
-        guard primeTask == nil else { return }
-
-        if let last = lastKnownResetsAt {
-            // Subsequent polls: detect reset (resetsAt moved to a later date)
-            guard resetsAt > last else { return }
-        } else {
-            // First poll after launch: if window looks idle, prime it
-            guard window.utilization < idleThreshold else { return }
+        // If we're already targeting this exact reset, nothing to do
+        if let target = targetResetDate, abs(target.timeIntervalSince(resetsAt)) < 30 {
+            return
         }
 
-        schedulePriming()
+        // Schedule for resetsAt + postResetDelay
+        let fireAt = resetsAt.addingTimeInterval(postResetDelay)
+
+        // Don't schedule if the fire time is in the past (window already reset, we missed it)
+        guard fireAt > Date() else { return }
+
+        schedulePriming(fireAt: fireAt, resetsAt: resetsAt)
     }
 
     // MARK: - Scheduling
 
-    private func schedulePriming() {
+    private func schedulePriming(fireAt: Date, resetsAt: Date) {
         cancelScheduled()
-        let fireAt = Date().addingTimeInterval(delay)
+        targetResetDate = resetsAt
         nextPrimeDate = fireAt
+
+        let delay = fireAt.timeIntervalSinceNow
+        NSLog("[ClaudeUsageBar] AutoPrimer: scheduled to fire in %.0f minutes (window resets at %@)",
+              delay / 60, resetsAt.description)
 
         primeTask = Task { [weak self] in
             guard let self else { return }
-            try? await Task.sleep(for: .seconds(self.delay))
+            try? await Task.sleep(for: .seconds(delay))
             guard !Task.isCancelled, self.isEnabled else { return }
-            await self.fireIfIdle()
+            await self.fire()
         }
     }
 
@@ -73,40 +82,44 @@ final class AutoPrimer: ObservableObject {
         primeTask?.cancel()
         primeTask = nil
         nextPrimeDate = nil
+        targetResetDate = nil
     }
 
     // MARK: - Fire
 
-    private func fireIfIdle() async {
-        // Try to get a token — if expired, attempt a refresh via CLI
+    private func fire() async {
+        // Try to get a token — if expired, attempt a direct OAuth refresh
         var token: String?
         token = try? tokenProvider?()
         if token == nil {
             NSLog("[ClaudeUsageBar] AutoPrimer: token expired, attempting refresh before priming")
-            if let fresh = try? await TokenRefresher.waitForTokenRefresh() {
+            if let fresh = try? await TokenRefresher.refreshToken() {
                 token = fresh.accessToken
             }
         }
 
         guard let token else {
             NSLog("[ClaudeUsageBar] AutoPrimer: no valid token available — skipping prime")
-            primeTask = nil
-            nextPrimeDate = nil
+            cleanup()
             return
         }
 
         do {
             try await sendPrimeMessage(using: token)
             lastPrimed = Date()
-            nextPrimeDate = nil
-            primeTask = nil
-            NSLog("[ClaudeUsageBar] AutoPrimer: successfully primed window")
+            NSLog("[ClaudeUsageBar] AutoPrimer: successfully primed new window")
+            cleanup()
             await onPrimed?()
         } catch {
             NSLog("[ClaudeUsageBar] AutoPrimer: prime failed — %@", error.localizedDescription)
-            primeTask = nil
-            nextPrimeDate = nil
+            cleanup()
         }
+    }
+
+    private func cleanup() {
+        primeTask = nil
+        nextPrimeDate = nil
+        targetResetDate = nil
     }
 
     // MARK: - Network
@@ -114,8 +127,10 @@ final class AutoPrimer: ObservableObject {
     private func sendPrimeMessage(using accessToken: String) async throws {
         var request = URLRequest(url: messagesURL)
         request.httpMethod = "POST"
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("2023-06-01",            forHTTPHeaderField: "anthropic-version")
+        request.setValue("oauth-2025-04-20",      forHTTPHeaderField: "anthropic-beta")
         request.setValue("application/json",       forHTTPHeaderField: "Content-Type")
 
         let body: [String: Any] = [
@@ -125,8 +140,18 @@ final class AutoPrimer: ObservableObject {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (_, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+        // Use ephemeral session to avoid caching issues
+        let config = URLSessionConfiguration.ephemeral
+        config.urlCache = nil
+        let session = URLSession(configuration: config)
+        defer { session.invalidateAndCancel() }
+
+        let (_, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw URLError(.badServerResponse)
+        }
+        guard http.statusCode == 200 else {
+            NSLog("[ClaudeUsageBar] AutoPrimer: API returned HTTP %d", http.statusCode)
             throw URLError(.badServerResponse)
         }
     }

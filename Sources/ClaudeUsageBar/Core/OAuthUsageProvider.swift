@@ -23,6 +23,15 @@ final class OAuthUsageProvider: ObservableObject {
     private let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
     private let poller = UsagePoller()
 
+    /// Ephemeral session — zero caching at every level (disk, memory, system).
+    /// Prevents macOS from caching 429 responses and serving stale errors.
+    private let urlSession: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        config.urlCache = nil
+        return URLSession(configuration: config)
+    }()
+
     /// Cached token to avoid hitting Keychain every poll cycle.
     /// Re-read only on startup, expiry, or 401.
     private var cachedToken: String?
@@ -34,6 +43,9 @@ final class OAuthUsageProvider: ObservableObject {
     // MARK: - Init
 
     init() {
+        // Purge any cached API responses (macOS can cache 429s and serve them forever)
+        URLCache.shared.removeAllCachedResponses()
+
         poller.onPoll = { [weak self] in await self?.poll() }
         autoPrimer.onPrimed = { [weak self] in self?.pollNow() }
         autoPrimer.tokenProvider = { [weak self] in
@@ -42,10 +54,7 @@ final class OAuthUsageProvider: ObservableObject {
         }
     }
 
-    // MARK: - UsageProvider conformance
-
-    /// Maximum number of token-refresh retries before giving up on a single poll cycle.
-    private static let maxRefreshRetries = 2
+    // MARK: - Polling
 
     func poll() async {
         do {
@@ -72,48 +81,37 @@ final class OAuthUsageProvider: ObservableObject {
         }
     }
 
-    /// Shared auth-recovery flow: invalidate cache, run CLI refresh, retry.
+    /// Refreshes the OAuth token directly via the Anthropic token endpoint,
+    /// then retries the usage fetch once.
     private func handleAuthExpired() async {
         invalidateTokenCache()
 
-        for attempt in 1...Self.maxRefreshRetries {
-            NSLog("[ClaudeUsageBar] Token refresh attempt %d/%d", attempt, Self.maxRefreshRetries)
-
-            do {
-                guard let fresh = try await TokenRefresher.waitForTokenRefresh() else {
-                    // CLI ran but token is still expired
-                    if attempt < Self.maxRefreshRetries {
-                        try? await Task.sleep(for: .seconds(2))
-                    }
-                    continue
-                }
-                cachedToken = fresh.accessToken
-                cachedTokenExpiry = fresh.expiresAt
-                let response = try await fetchUsage(using: fresh.accessToken)
-                applyResponse(response)
-                poller.lastPollError = nil
-                NSLog("[ClaudeUsageBar] Token refresh succeeded on attempt %d", attempt)
+        do {
+            guard let fresh = try await TokenRefresher.refreshToken() else {
+                // Refresh was skipped (rate-limited or too soon) — just set the error
+                setError(.authExpired)
                 return
-            } catch let e as KeychainError where e.isAccessDenied {
-                // Keychain prompted and user denied — stop immediately, don't re-prompt
-                NSLog("[ClaudeUsageBar] Keychain denied during refresh — aborting retries")
-                setError(.keychainDenied)
-                return
-            } catch UsageError.authExpired {
-                // Token was refreshed but API still rejected — try again
-                invalidateTokenCache()
-                if attempt < Self.maxRefreshRetries {
-                    try? await Task.sleep(for: .seconds(2))
-                }
-                continue
-            } catch let e as UsageError {
-                setError(e); return
-            } catch {
-                setError(.networkError(error.localizedDescription)); return
             }
-        }
+            cachedToken = fresh.accessToken
+            cachedTokenExpiry = fresh.expiresAt
 
-        setError(.authExpired)
+            // Token refreshed — try fetching usage with it
+            let response = try await fetchUsage(using: fresh.accessToken)
+            applyResponse(response)
+            poller.lastPollError = nil
+            NSLog("[ClaudeUsageBar] Token refresh + usage fetch succeeded")
+        } catch let e as KeychainError where e.isAccessDenied {
+            NSLog("[ClaudeUsageBar] Keychain denied during refresh")
+            setError(.keychainDenied)
+        } catch let e as UsageError where e.isRateLimited {
+            // Usage API returned 429 but the token IS fresh — just wait
+            NSLog("[ClaudeUsageBar] Usage API rate limited after token refresh")
+            setError(e)
+        } catch let e as UsageError {
+            setError(e)
+        } catch {
+            setError(.networkError(error.localizedDescription))
+        }
     }
 
     func startPolling() {
@@ -125,8 +123,11 @@ final class OAuthUsageProvider: ObservableObject {
     }
 
     /// Cancels the current sleep and polls immediately (e.g. "Poll Now" menu item).
-    /// This is user-triggered, so we allow Keychain UI prompts (one-time password dialog).
+    /// This is user-triggered, so we allow Keychain UI prompts and reset backoffs.
     func pollNow() {
+        // Reset refresh backoff — the user is explicitly asking to retry
+        TokenRefresher.resetBackoff()
+
         // If we're in a keychainDenied state, try a UI-allowed read first.
         // This is the only code path that shows a Keychain password dialog.
         if case .keychainDenied = error {
@@ -195,16 +196,33 @@ final class OAuthUsageProvider: ObservableObject {
         cachedTokenExpiry = nil
     }
 
+    /// Writes debug info to ~/Desktop/claude-usage-debug.log for diagnosing API issues.
+    /// Remove once the 429 issue is resolved.
+    private static func appendDebugLog(_ message: String) {
+        let path = NSHomeDirectory() + "/Desktop/claude-usage-debug.log"
+        let line = message + "\n"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(line.data(using: .utf8) ?? Data())
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+        }
+    }
+
     // MARK: - Network
 
     /// Token is passed in, used only within this call, then discarded.
     private func fetchUsage(using accessToken: String) async throws -> UsageResponse {
         var request = URLRequest(url: usageURL)
         request.timeoutInterval = 15
+        // CRITICAL: Never use cached responses. macOS can cache 429 responses and serve
+        // them indefinitely, causing the app to appear permanently rate-limited.
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("oauth-2025-04-20",      forHTTPHeaderField: "anthropic-beta")
 
-        let (data, httpResponse) = try await URLSession.shared.data(for: request)
+        let (data, httpResponse) = try await urlSession.data(for: request)
 
         guard let http = httpResponse as? HTTPURLResponse else {
             throw UsageError.networkError("Expected HTTP response")
@@ -213,7 +231,22 @@ final class OAuthUsageProvider: ObservableObject {
         switch http.statusCode {
         case 200:   break
         case 401:   throw UsageError.authExpired
-        case 429:   throw UsageError.rateLimited
+        case 429:
+            // Dump full 429 details to a debug file — NSLog doesn't reliably appear in macOS logs
+            let body = String(data: data, encoding: .utf8) ?? "(no body)"
+            let retryAfterStr = http.value(forHTTPHeaderField: "Retry-After") ?? "not set"
+            let allHeaders = http.allHeaderFields.map { "\($0.key): \($0.value)" }.joined(separator: "\n  ")
+            let debugInfo = """
+            [\(Date())] 429 Rate Limited
+            Retry-After: \(retryAfterStr)
+            Headers:
+              \(allHeaders)
+            Body: \(body)
+            ---
+            """
+            Self.appendDebugLog(debugInfo)
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+            throw UsageError.rateLimited(retryAfter: retryAfter)
         default:    throw UsageError.httpError(http.statusCode)
         }
 

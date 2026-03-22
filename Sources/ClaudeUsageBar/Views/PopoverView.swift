@@ -60,7 +60,7 @@ struct PopoverView: View {
 
             Divider()
             FooterView(lastUpdated: provider.lastUpdated, onRefresh: {
-                Task { await provider.poll() }
+                provider.pollNow()
             })
         }
         .frame(width: 300)
@@ -104,7 +104,7 @@ struct PopoverView: View {
         if let last = primer.lastPrimed {
             return "Last primed \(Self.timeFormatter.string(from: last))"
         }
-        return "Primes 55 min after reset"
+        return "Primes after window resets"
     }
 
     // MARK: - Loading placeholder
