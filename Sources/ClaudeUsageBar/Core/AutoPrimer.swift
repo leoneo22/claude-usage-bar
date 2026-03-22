@@ -4,8 +4,12 @@ import Foundation
 /// so the new window starts counting immediately rather than waiting
 /// for the user's next organic usage.
 ///
-/// Detection: compares `resetsAt` across polls — when it jumps forward,
-/// a reset just happened. Fires within seconds.
+/// Detection uses TWO methods:
+///   1. Jump detection: `resetsAt` moves forward by >1 hour = new window.
+///   2. Idle detection: utilization < 2% and we haven't primed yet.
+///
+/// The idle detection is the safety net — it catches cases where the jump
+/// was missed (app restart, `resetsAt` was nil, timing edge cases).
 ///
 /// Cost: ~3 tokens per fire — negligible.
 @MainActor
@@ -38,56 +42,99 @@ final class AutoPrimer: ObservableObject {
 
     private var primeTask: Task<Void, Never>?
     private var lastKnownResetsAt: Date?
+    /// Prevents re-priming the same window. Reset when a new window is detected.
+    private var hasPrimedThisWindow: Bool = false
 
     /// Set to true when the system wakes from sleep.
     /// Causes the next primer to fire with minimal delay.
     private(set) var isPostWake: Bool = false
+
+    // MARK: - Diagnostics
+
+    /// File-based log for debugging — NSLog doesn't reliably appear in macOS Console.
+    private static let logPath = NSHomeDirectory() + "/.claude/primer-diagnostic.log"
+
+    private static func log(_ message: String) {
+        let line = "[\(ISO8601DateFormatter().string(from: Date()))] \(message)\n"
+        NSLog("[ClaudeUsageBar] AutoPrimer: %@", message)
+        if let fh = FileHandle(forWritingAtPath: logPath) {
+            fh.seekToEndOfFile()
+            fh.write(line.data(using: .utf8) ?? Data())
+            fh.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: logPath, contents: line.data(using: .utf8))
+        }
+    }
 
     // MARK: - Public API
 
     /// Called when the system wakes from sleep. Primes with minimal delay.
     func notifyWake() {
         isPostWake = true
-        NSLog("[ClaudeUsageBar] AutoPrimer: wake detected — will use fast priming if reset found")
+        Self.log("wake detected — will use fast priming if reset found")
     }
 
     /// Called by OAuthUsageProvider after each successful poll.
     /// Detects when a window reset occurred and schedules a primer.
     func handleUpdate(_ window: UsageWindow) {
-        guard let resetsAt = window.resetsAt else { return }
+        let resetsAt = window.resetsAt  // may be nil for fresh windows
 
         defer {
-            lastKnownResetsAt = resetsAt
+            if let resetsAt {
+                lastKnownResetsAt = resetsAt
+            }
             isPostWake = false  // consumed
         }
 
-        guard isEnabled else { return }
-        guard primeTask == nil else { return }
+        Self.log("handleUpdate: util=\(String(format: "%.1f", window.utilization))% resetsAt=\(resetsAt?.description ?? "nil") lastKnown=\(lastKnownResetsAt?.description ?? "nil") hasPrimed=\(hasPrimedThisWindow) taskActive=\(primeTask != nil)")
 
-        let shouldPrime: Bool
-        if let last = lastKnownResetsAt {
-            // A real reset moves resetsAt forward by ~5 hours.
-            // Small shifts (< 1 hour) are just the API adjusting — NOT a reset.
-            let jump = resetsAt.timeIntervalSince(last)
-            shouldPrime = jump > 3600
-            if shouldPrime {
-                NSLog("[ClaudeUsageBar] AutoPrimer: resetsAt jumped %.0f seconds forward — reset detected", jump)
-            }
-        } else {
-            // First poll after launch: prime if window looks idle
-            shouldPrime = window.utilization < idleThreshold
-            if shouldPrime {
-                NSLog("[ClaudeUsageBar] AutoPrimer: first poll, utilization %.1f%% < threshold — will prime", window.utilization)
-            }
+        guard isEnabled else {
+            Self.log("  → skipped: disabled")
+            return
+        }
+        guard primeTask == nil else {
+            Self.log("  → skipped: task already active")
+            return
         }
 
-        guard shouldPrime else { return }
+        // Detect window reset: resetsAt jumped forward by more than 1 hour
+        let isNewWindow: Bool
+        if let resetsAt, let last = lastKnownResetsAt {
+            let jump = resetsAt.timeIntervalSince(last)
+            isNewWindow = jump > 3600
+            if isNewWindow {
+                Self.log("  → NEW WINDOW detected: resetsAt jumped \(Int(jump))s forward")
+            }
+        } else {
+            isNewWindow = false
+        }
 
-        // If we just woke from sleep, network is confirmed up (we just polled) → fire fast
+        // Reset the "already primed" flag when a new window is detected
+        if isNewWindow {
+            hasPrimedThisWindow = false
+        }
+
+        // If we already primed this window, don't prime again
+        guard !hasPrimedThisWindow else {
+            Self.log("  → skipped: already primed this window")
+            return
+        }
+
+        // Should we prime?
+        //  1. We just detected a new window via jump
+        //  2. Window is idle (utilization < 2%) — catches missed jumps, nil resetsAt, app restarts
+        let shouldPrime = isNewWindow || window.utilization < idleThreshold
+
+        if !shouldPrime {
+            Self.log("  → skipped: not new window and utilization \(String(format: "%.1f", window.utilization))% >= threshold")
+            return
+        }
+
+        let reason = isNewWindow ? "new window (jump)" : "idle window (util \(String(format: "%.1f", window.utilization))%)"
         let delay = isPostWake ? wakeDelay : normalDelay
         let fireAt = Date().addingTimeInterval(delay)
+        Self.log("  → PRIMING in \(Int(delay))s — reason: \(reason), wake=\(isPostWake)")
         schedulePriming(fireAt: fireAt)
-        NSLog("[ClaudeUsageBar] AutoPrimer: priming in %.0f seconds (wake=%@)", delay, isPostWake ? "yes" : "no")
     }
 
     // MARK: - Scheduling
@@ -102,7 +149,10 @@ final class AutoPrimer: ObservableObject {
             if delay > 0 {
                 try? await Task.sleep(for: .seconds(delay))
             }
-            guard !Task.isCancelled, self.isEnabled else { return }
+            guard !Task.isCancelled, self.isEnabled else {
+                Self.log("fire cancelled before execution")
+                return
+            }
             await self.fire()
         }
     }
@@ -119,6 +169,7 @@ final class AutoPrimer: ObservableObject {
     func primeNow() {
         cancelScheduled()
         lastResult = "Firing…"
+        Self.log("primeNow() called — manual trigger")
         primeTask = Task { [weak self] in
             guard let self else { return }
             await self.fire()
@@ -126,19 +177,21 @@ final class AutoPrimer: ObservableObject {
     }
 
     private func fire() async {
+        Self.log("fire() starting — getting token")
         // Try to get a token — if expired, attempt a direct OAuth refresh
         var token: String?
         token = try? tokenProvider?()
         if token == nil {
-            NSLog("[ClaudeUsageBar] AutoPrimer: token expired, attempting refresh before priming")
+            Self.log("fire() token expired, attempting refresh")
             lastResult = "Refreshing token…"
             if let fresh = try? await TokenRefresher.refreshToken() {
                 token = fresh.accessToken
+                Self.log("fire() token refreshed successfully")
             }
         }
 
         guard let token else {
-            NSLog("[ClaudeUsageBar] AutoPrimer: no valid token available — skipping prime")
+            Self.log("fire() FAILED — no valid token")
             lastResult = "❌ No valid token"
             cleanup()
             return
@@ -146,14 +199,15 @@ final class AutoPrimer: ObservableObject {
 
         do {
             try await sendPrimeMessage(using: token)
+            hasPrimedThisWindow = true
             lastPrimed = Date()
             lastResult = "✅ Primed at \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short))"
-            NSLog("[ClaudeUsageBar] AutoPrimer: successfully primed new window")
+            Self.log("fire() SUCCESS — primed at \(Date())")
             cleanup()
             await onPrimed?()
         } catch {
             lastResult = "❌ \(error.localizedDescription)"
-            NSLog("[ClaudeUsageBar] AutoPrimer: prime failed — %@", error.localizedDescription)
+            Self.log("fire() FAILED — \(error.localizedDescription)")
             cleanup()
         }
     }
@@ -187,12 +241,13 @@ final class AutoPrimer: ObservableObject {
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
 
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw URLError(.badServerResponse)
         }
         guard http.statusCode == 200 else {
-            NSLog("[ClaudeUsageBar] AutoPrimer: API returned HTTP %d", http.statusCode)
+            let responseBody = String(data: data, encoding: .utf8) ?? "(no body)"
+            Self.log("API returned HTTP \(http.statusCode): \(responseBody)")
             throw URLError(.badServerResponse)
         }
     }
