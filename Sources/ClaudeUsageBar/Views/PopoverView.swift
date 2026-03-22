@@ -98,8 +98,14 @@ struct PopoverView: View {
     private var primerStatusText: String {
         guard primer.isEnabled else { return "Disabled" }
         if let next = primer.nextPrimeDate {
-            let mins = Int(next.timeIntervalSinceNow / 60)
-            return "Primes in ~\(max(0, mins)) min"
+            let secs = Int(next.timeIntervalSinceNow)
+            if secs < 60 {
+                return "Primes in ~\(max(0, secs))s"
+            }
+            return "Primes in ~\(secs / 60) min"
+        }
+        if let result = primer.lastResult {
+            return result
         }
         if let last = primer.lastPrimed {
             return "Last primed \(Self.timeFormatter.string(from: last))"

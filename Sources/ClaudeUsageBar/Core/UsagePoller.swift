@@ -3,13 +3,19 @@ import AppKit
 // MARK: - Polling intervals (seconds)
 
 private enum Interval {
-    static let normal:         Double = 60
-    static let afterError:     Double = 30
-    static let backoff:        Double = 300   // 5 min — after 3 consecutive errors
-    static let rateLimited1st: Double = 30    // 30 sec — first 429 (usually transient after wake)
-    static let rateLimited:    Double = 120   // 2 min — subsequent 429s
-    static let keychainDenied: Double = 600   // 10 min — don't spam password dialogs
-    static let afterWake:      Double = 5     // let network stack reconnect
+    static let normal:         Double = 180    // 3 min — usage doesn't change faster than this
+    static let afterError:     Double = 60     // 1 min — general error retry
+    static let backoff:        Double = 300    // 5 min — after 3 consecutive errors
+    static let keychainDenied: Double = 600    // 10 min — don't spam password dialogs
+    static let afterWake:      Double = 5      // let network stack reconnect
+
+    /// Exponential backoff for 429s: 2 min → 4 min → 8 min → 10 min cap.
+    /// The usage API has strict rate limits; hammering it keeps us locked out.
+    static func rateLimitBackoff(consecutiveErrors: Int) -> Double {
+        let base: Double = 120  // start at 2 min
+        let multiplier = pow(2.0, Double(max(0, consecutiveErrors - 1)))
+        return min(base * multiplier, 600)  // cap at 10 min
+    }
 }
 
 // MARK: - UsagePoller
@@ -24,14 +30,19 @@ final class UsagePoller {
 
     /// Called every time a poll should occur. `onPoll` should set `lastPollError`.
     var onPoll: (() async -> Void)?
+    /// Called when the system wakes from sleep, before polling.
+    var onWake: (() -> Void)?
     /// Set by the provider after each poll so the poller knows whether to back off.
     var lastPollError: UsageError?
 
     // MARK: - State
 
     private var pollingTask: Task<Void, Never>?
-    private var consecutiveErrors = 0
+    private(set) var consecutiveErrors = 0
     private var wakeObserver: (any NSObjectProtocol)?
+
+    /// The next time a poll will fire — exposed so the UI can show "retrying in ~X min".
+    private(set) var nextPollDate: Date?
 
     // MARK: - Public API
 
@@ -44,6 +55,7 @@ final class UsagePoller {
     func stop() {
         pollingTask?.cancel()
         pollingTask = nil
+        nextPollDate = nil
         if let observer = wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(observer)
             wakeObserver = nil
@@ -52,6 +64,7 @@ final class UsagePoller {
 
     /// Cancels current sleep and fires a poll immediately.
     func pollImmediately() {
+        consecutiveErrors = 0   // user asked — reset backoff
         pollingTask?.cancel()
         scheduleLoop(delay: 0)
     }
@@ -64,14 +77,17 @@ final class UsagePoller {
 
             // Optional initial delay (e.g. after rate-limit or backoff)
             if let delay, delay > 0 {
+                self.nextPollDate = Date().addingTimeInterval(delay)
                 do { try await Task.sleep(for: .seconds(delay)) }
                 catch { return }
             }
 
             while !Task.isCancelled {
+                self.nextPollDate = nil
                 await self.onPoll?()
                 self.updateErrorCount()
                 let interval = self.nextInterval()
+                self.nextPollDate = Date().addingTimeInterval(interval)
                 do { try await Task.sleep(for: .seconds(interval)) }
                 catch { return }
             }
@@ -89,15 +105,13 @@ final class UsagePoller {
     private func nextInterval() -> Double {
         switch lastPollError {
         case .rateLimited(let retryAfter):
-            // If the API told us exactly when to retry, respect it (capped at 10 min).
+            // If the API told us exactly when to retry AND it's > 0, respect it (capped at 10 min).
             if let seconds = retryAfter, seconds > 0 {
                 return min(seconds, 600)
             }
-            // No Retry-After header: first 429 retry quickly, then escalate.
-            return consecutiveErrors <= 1 ? Interval.rateLimited1st : Interval.rateLimited
+            // retry-after: 0 or missing → exponential backoff: 2m, 4m, 8m, 10m cap
+            return Interval.rateLimitBackoff(consecutiveErrors: consecutiveErrors)
         case .keychainDenied:
-            // User denied Keychain access — don't keep spamming password dialogs.
-            // Wait 10 min, or until the user manually triggers "Poll Now".
             return Interval.keychainDenied
         case .some:
             return consecutiveErrors >= 3 ? Interval.backoff : Interval.afterError
@@ -110,6 +124,7 @@ final class UsagePoller {
 
     /// Polls after wake with a brief delay to let Wi-Fi/DNS reconnect.
     func pollAfterWake() {
+        onWake?()  // Notify listeners (e.g. AutoPrimer) before polling
         pollingTask?.cancel()
         scheduleLoop(delay: Interval.afterWake)
     }

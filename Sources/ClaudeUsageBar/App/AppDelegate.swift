@@ -128,6 +128,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         primerItem.state = provider.autoPrimer.isEnabled ? .on : .off
         menu.addItem(primerItem)
 
+        // Test Primer (fire immediately for debugging)
+        menu.addItem(NSMenuItem(title: "Test Primer Now", action: #selector(testPrimerNow), keyEquivalent: ""))
+
         // Desktop Widget toggle
         let widgetItem = NSMenuItem(title: "Desktop Widget", action: #selector(toggleWidget), keyEquivalent: "")
         widgetItem.state = widgetWindow.isVisible ? .on : .off
@@ -164,6 +167,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func togglePrimer() {
         provider.autoPrimer.isEnabled.toggle()
+    }
+
+    @objc private func testPrimerNow() {
+        provider.autoPrimer.primeNow()
     }
 
     @objc private func toggleStartAtLogin() {

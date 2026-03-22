@@ -47,6 +47,7 @@ final class OAuthUsageProvider: ObservableObject {
         URLCache.shared.removeAllCachedResponses()
 
         poller.onPoll = { [weak self] in await self?.poll() }
+        poller.onWake = { [weak self] in self?.autoPrimer.notifyWake() }
         autoPrimer.onPrimed = { [weak self] in self?.pollNow() }
         autoPrimer.tokenProvider = { [weak self] in
             guard let self else { throw UsageError.authExpired }
@@ -157,6 +158,9 @@ final class OAuthUsageProvider: ObservableObject {
         lastUpdated = Date()
         error = nil
         autoPrimer.handleUpdate(response.fiveHour)
+
+        // Export current tokens to iCloud Drive for the iOS phone-based primer
+        exportTokensToiCloud()
     }
 
     private func setError(_ e: UsageError) {
@@ -196,18 +200,50 @@ final class OAuthUsageProvider: ObservableObject {
         cachedTokenExpiry = nil
     }
 
-    /// Writes debug info to ~/Desktop/claude-usage-debug.log for diagnosing API issues.
-    /// Remove once the 429 issue is resolved.
-    private static func appendDebugLog(_ message: String) {
-        let path = NSHomeDirectory() + "/Desktop/claude-usage-debug.log"
-        let line = message + "\n"
-        if let fh = FileHandle(forWritingAtPath: path) {
-            fh.seekToEndOfFile()
-            fh.write(line.data(using: .utf8) ?? Data())
-            fh.closeFile()
-        } else {
-            FileManager.default.createFile(atPath: path, contents: line.data(using: .utf8))
+    // MARK: - iCloud token export (for iOS phone-based primer)
+
+    /// Exports the current access + refresh token to iCloud Drive so the iOS Shortcut
+    /// can read them and fire primer messages overnight.
+    ///
+    /// File: ~/Library/Mobile Documents/com~apple~CloudDocs/ClaudePrimer/token.json
+    /// Syncs automatically to the user's iPhone via iCloud Drive.
+    private func exportTokensToiCloud() {
+        guard let token = cachedToken, let expiry = cachedTokenExpiry else { return }
+
+        // Read refresh token from Keychain for the export
+        let refreshToken: String?
+        do {
+            let creds = try KeychainManager.readClaudeCredentials(allowUI: false)
+            refreshToken = creds.refreshToken
+        } catch {
+            refreshToken = nil
         }
+
+        let payload: [String: Any] = [
+            "access_token": token,
+            "refresh_token": refreshToken ?? "",
+            "expires_at": expiry.timeIntervalSince1970,
+            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+            "updated_at": ISO8601DateFormatter().string(from: Date()),
+        ]
+
+        let fm = FileManager.default
+        let iCloudDir = fm.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/ClaudePrimer")
+
+        do {
+            try fm.createDirectory(at: iCloudDir, withIntermediateDirectories: true)
+            let file = iCloudDir.appendingPathComponent("token.json")
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: file, options: .atomic)
+        } catch {
+            // Non-critical — don't log noise if iCloud Drive isn't set up
+        }
+    }
+
+    /// Debug logging for API issues — writes to NSLog only (no disk file).
+    private static func appendDebugLog(_ message: String) {
+        NSLog("[ClaudeUsageBar] %@", message)
     }
 
     // MARK: - Network
