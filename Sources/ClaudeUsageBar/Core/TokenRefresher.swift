@@ -64,9 +64,16 @@ enum TokenRefresher {
                 refreshToken: response.refreshToken ?? current.refreshToken,
                 expiresAt: response.expiresAt
             )
-            try KeychainManager.writeClaudeCredentials(newCreds)
-            NSLog("[ClaudeUsageBar] Token refreshed successfully — expires %@",
-                  newCreds.expiresAt.description)
+            // Write back to Keychain — if this fails (access denied), the in-memory
+            // token still works for this session. Don't let a write failure block usage.
+            do {
+                try KeychainManager.writeClaudeCredentials(newCreds)
+                NSLog("[ClaudeUsageBar] Token refreshed + written to Keychain — expires %@",
+                      newCreds.expiresAt.description)
+            } catch {
+                NSLog("[ClaudeUsageBar] Token refreshed but Keychain write failed (ACL) — using in-memory token. expires %@",
+                      newCreds.expiresAt.description)
+            }
             return newCreds
 
         case .rateLimited(let retryAfter):

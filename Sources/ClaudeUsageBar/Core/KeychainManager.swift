@@ -101,15 +101,24 @@ enum KeychainManager {
 
     /// Writes refreshed credentials back to Keychain in the format Claude Code expects.
     ///
+    /// **All operations are silent** — uses `LAContext.interactionNotAllowed` to prevent
+    /// macOS password dialogs. If Keychain access is denied, the write is skipped silently;
+    /// the in-memory token from the refresh response still works for the current session.
+    ///
     /// Reads the existing blob first to preserve any extra fields (scopes, subscriptionType, etc.),
     /// then updates only the token fields.
     static func writeClaudeCredentials(_ creds: OAuthCredentials) throws {
-        // Read existing blob to preserve extra fields
+        // All Keychain operations must be silent — no password dialogs
+        let silentContext = LAContext()
+        silentContext.interactionNotAllowed = true
+
+        // Read existing blob to preserve extra fields (silent — skip if denied)
         let readQuery: [CFString: Any] = [
             kSecClass:       kSecClassGenericPassword,
             kSecAttrService: claudeCodeService,
             kSecReturnData:  kCFBooleanTrue as Any,
             kSecMatchLimit:  kSecMatchLimitOne,
+            kSecUseAuthenticationContext: silentContext,
         ]
 
         var existingBlob: [String: Any] = [:]
@@ -129,10 +138,11 @@ enum KeychainManager {
         let wrapper: [String: Any] = ["claudeAiOauth": existingBlob]
         let data = try JSONSerialization.data(withJSONObject: wrapper)
 
-        // Update existing item (or add if not found)
+        // Update existing item (or add if not found) — silent, no password dialogs
         let updateQuery: [CFString: Any] = [
             kSecClass:       kSecClassGenericPassword,
             kSecAttrService: claudeCodeService,
+            kSecUseAuthenticationContext: silentContext,
         ]
         let attrs: [CFString: Any] = [
             kSecValueData: data,
@@ -144,11 +154,18 @@ enum KeychainManager {
         case errSecSuccess:
             break
         case errSecItemNotFound:
-            // Item doesn't exist yet — add it
-            var addQuery = updateQuery
-            addQuery[kSecValueData] = data
+            // Item doesn't exist yet — add it (also silent)
+            let addQuery: [CFString: Any] = [
+                kSecClass:       kSecClassGenericPassword,
+                kSecAttrService: claudeCodeService,
+                kSecValueData:   data,
+                kSecUseAuthenticationContext: silentContext,
+            ]
             let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
             guard addStatus == errSecSuccess else {
+                if addStatus == errSecAuthFailed || addStatus == errSecInteractionNotAllowed {
+                    throw KeychainError.accessDenied
+                }
                 throw KeychainError.osError(addStatus)
             }
         case errSecAuthFailed, errSecUserCanceled, errSecInteractionNotAllowed:
