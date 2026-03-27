@@ -80,9 +80,7 @@ final class AutoPrimer: ObservableObject {
         let resetsAt = window.resetsAt  // may be nil for fresh windows
 
         defer {
-            if let resetsAt {
-                lastKnownResetsAt = resetsAt
-            }
+            lastKnownResetsAt = resetsAt  // track nil too — nil means window expired
             isPostWake = false  // consumed
         }
 
@@ -97,21 +95,25 @@ final class AutoPrimer: ObservableObject {
             return
         }
 
-        // Detect window reset: resetsAt jumped forward by more than 1 hour
+        // Detect window expired: resetsAt was non-nil, now nil.
+        // This is the critical transition — the old window is gone,
+        // so we MUST clear hasPrimed to allow priming the next one.
+        if resetsAt == nil && lastKnownResetsAt != nil {
+            Self.log("  → window EXPIRED: resetsAt went nil, clearing hasPrimed")
+            hasPrimedThisWindow = false
+        }
+
+        // Detect new window: resetsAt jumped forward by more than 1 hour
         let isNewWindow: Bool
         if let resetsAt, let last = lastKnownResetsAt {
             let jump = resetsAt.timeIntervalSince(last)
             isNewWindow = jump > 3600
             if isNewWindow {
                 Self.log("  → NEW WINDOW detected: resetsAt jumped \(Int(jump))s forward")
+                hasPrimedThisWindow = false
             }
         } else {
             isNewWindow = false
-        }
-
-        // Reset the "already primed" flag when a new window is detected
-        if isNewWindow {
-            hasPrimedThisWindow = false
         }
 
         // If we already primed this window, don't prime again
@@ -201,8 +203,12 @@ final class AutoPrimer: ObservableObject {
             try await sendPrimeMessage(using: token)
             hasPrimedThisWindow = true
             lastPrimed = Date()
-            lastResult = "✅ Primed at \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short))"
+            lastResult = "⛽ Fueled at \(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .short))"
             Self.log("fire() SUCCESS — primed at \(Date())")
+
+            // 🔔 Ding-ding! You're fueled up.
+            FuelGaugeBell.play()
+
             cleanup()
             await onPrimed?()
         } catch {
