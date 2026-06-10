@@ -2,7 +2,7 @@ import Foundation
 
 /// OAuth credentials stored by Claude Code in the Keychain.
 /// Claude Code (TypeScript) uses camelCase keys; we also accept snake_case as fallback.
-struct OAuthCredentials: Decodable, Sendable {
+struct OAuthCredentials: Codable, Sendable {
     let accessToken: String
     let refreshToken: String
     /// Absolute expiry date (converted from ms or seconds as needed).
@@ -48,6 +48,14 @@ struct OAuthCredentials: Decodable, Sendable {
     }
 
     var isExpired: Bool { expiresAt <= Date() }
+
+    /// Encode to a stable camelCase shape with ms timestamps (matches Claude Code's format).
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: AnyKey.self)
+        try c.encode(accessToken, forKey: AnyKey("accessToken"))
+        try c.encode(refreshToken, forKey: AnyKey("refreshToken"))
+        try c.encode(expiresAt.timeIntervalSince1970 * 1000, forKey: AnyKey("expiresAt"))
+    }
 }
 
 // MARK: - Dynamic CodingKey

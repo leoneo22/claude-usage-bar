@@ -48,32 +48,35 @@ enum TokenRefresher {
 
         _lastRefreshAttempt = Date()
 
-        // Read current credentials to get the refresh_token
-        let current = try KeychainManager.readClaudeCredentials(allowUI: false)
+        // Read current refresh_token from our own item (silent), with a one-time
+        // fallback to Claude Code's item if we haven't bootstrapped yet.
+        let currentRefreshToken: String
+        if let own = KeychainManager.readOwnCredentials() {
+            currentRefreshToken = own.refreshToken
+        } else {
+            let bootstrap = try KeychainManager.readClaudeCredentials(allowUI: false)
+            currentRefreshToken = bootstrap.refreshToken
+        }
 
         NSLog("[ClaudeUsageBar] Attempting OAuth token refresh...")
 
         // Call the token endpoint
-        let result = try await callTokenEndpoint(refreshToken: current.refreshToken)
+        let result = try await callTokenEndpoint(refreshToken: currentRefreshToken)
 
         switch result {
         case .success(let response):
-            // Build new credentials and write to Keychain
             let newCreds = OAuthCredentials(
                 accessToken: response.accessToken,
-                refreshToken: response.refreshToken ?? current.refreshToken,
+                refreshToken: response.refreshToken ?? currentRefreshToken,
                 expiresAt: response.expiresAt
             )
-            // Write back to Keychain — if this fails (access denied), the in-memory
-            // token still works for this session. Don't let a write failure block usage.
-            do {
-                try KeychainManager.writeClaudeCredentials(newCreds)
-                NSLog("[ClaudeUsageBar] Token refreshed + written to Keychain — expires %@",
-                      newCreds.expiresAt.description)
-            } catch {
-                NSLog("[ClaudeUsageBar] Token refreshed but Keychain write failed (ACL) — using in-memory token. expires %@",
-                      newCreds.expiresAt.description)
-            }
+            // Write to OUR keychain item — we own it, no ACL prompt.
+            // We deliberately do NOT write back to Claude Code's item.
+            // Touching Claude Code's item triggers trusted-apps-list prompts
+            // that cannot be suppressed from the calling side.
+            let wrote = KeychainManager.writeOwnCredentials(newCreds)
+            NSLog("[ClaudeUsageBar] Token refreshed — own keychain write %@. Expires %@",
+                  wrote ? "OK" : "FAILED", newCreds.expiresAt.description)
             return newCreds
 
         case .rateLimited(let retryAfter):
@@ -84,8 +87,61 @@ enum TokenRefresher {
 
         case .error(let message):
             NSLog("[ClaudeUsageBar] Token refresh failed: %@", message)
+            // invalid_grant = our stored refresh token has been revoked (e.g. the
+            // claude CLI rotated it). Claude Code's keychain item likely holds fresh
+            // credentials — re-bootstrap from it instead of failing forever.
+            if message.contains("invalid_grant") {
+                return try await rebootstrapFromClaudeCode(failedRefreshToken: currentRefreshToken)
+            }
             return nil
         }
+    }
+
+    /// Recovers from a revoked refresh token by re-reading Claude Code's keychain item.
+    ///
+    /// Silent read — if the user granted "Always Allow" during the original bootstrap,
+    /// this self-heals with zero prompts. Returns nil if Claude Code's item is
+    /// inaccessible or holds the same dead token.
+    private static func rebootstrapFromClaudeCode(failedRefreshToken: String) async throws -> OAuthCredentials? {
+        NSLog("[ClaudeUsageBar] Refresh token revoked — attempting re-bootstrap from Claude Code's keychain item")
+
+        let cli: OAuthCredentials
+        do {
+            cli = try KeychainManager.readClaudeCredentials(allowUI: false)
+        } catch {
+            NSLog("[ClaudeUsageBar] Re-bootstrap failed — can't read Claude Code's item: %@", error.localizedDescription)
+            return nil
+        }
+
+        guard cli.refreshToken != failedRefreshToken else {
+            NSLog("[ClaudeUsageBar] Re-bootstrap aborted — Claude Code has the same revoked token. Run `claude` in Terminal to re-authenticate.")
+            return nil
+        }
+
+        // Claude Code has newer credentials — replace our own item with them
+        KeychainManager.deleteOwnCredentials()
+        KeychainManager.writeOwnCredentials(cli)
+
+        if !cli.isExpired {
+            NSLog("[ClaudeUsageBar] Re-bootstrap succeeded — using Claude Code's current access token")
+            return cli
+        }
+
+        // CLI's access token is expired too — refresh with its newer refresh token
+        NSLog("[ClaudeUsageBar] Re-bootstrapped refresh token found, access token expired — refreshing")
+        let result = try await callTokenEndpoint(refreshToken: cli.refreshToken)
+        guard case .success(let response) = result else {
+            NSLog("[ClaudeUsageBar] Re-bootstrap refresh also failed. Run `claude` in Terminal to re-authenticate.")
+            return nil
+        }
+        let creds = OAuthCredentials(
+            accessToken: response.accessToken,
+            refreshToken: response.refreshToken ?? cli.refreshToken,
+            expiresAt: response.expiresAt
+        )
+        KeychainManager.writeOwnCredentials(creds)
+        NSLog("[ClaudeUsageBar] Re-bootstrap + refresh succeeded — expires %@", creds.expiresAt.description)
+        return creds
     }
 
     /// Resets rate-limit state (e.g. when the user manually triggers "Poll Now").

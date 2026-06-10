@@ -41,9 +41,22 @@ enum KeychainError: Error, LocalizedError {
 /// - Never caches tokens — each call reads from Keychain directly.
 /// - Never logs credential values.
 /// - Writes use the same format Claude Code expects (wrapped in "claudeAiOauth").
+///
+/// Two keychain items are used:
+///   - `claudeCodeService` ("Claude Code-credentials"): owned by Claude Code CLI.
+///     We bootstrap from this ONCE, then never touch it again. Touching it triggers
+///     "trusted apps list" ACL prompts that cannot be suppressed from the calling side.
+///   - `ownService` ("ClaudeUsageBar-OAuth"): owned by ClaudeUsageBar itself.
+///     We create it on first run and use it for all subsequent reads/writes.
+///     Because we own it, our app is automatically on its trusted apps list →
+///     zero prompts on read/write/refresh.
 enum KeychainManager {
     /// The service name written by Claude Code's `keytar` call.
     static let claudeCodeService = "Claude Code-credentials"
+
+    /// Service name for our own copy of the credentials. Owned by ClaudeUsageBar,
+    /// so reads/writes don't trigger Keychain trust prompts.
+    static let ownService = "ClaudeUsageBar-OAuth"
 
     /// Returns fresh credentials decoded from the Keychain.
     ///
@@ -173,5 +186,83 @@ enum KeychainManager {
         default:
             throw KeychainError.osError(status)
         }
+    }
+
+    // MARK: - Own keychain item (no ACL prompts)
+
+    /// Reads credentials from ClaudeUsageBar's own keychain item.
+    /// Returns nil if the item doesn't exist yet (first run).
+    ///
+    /// Because ClaudeUsageBar created this item, our app is on its trusted apps list
+    /// by default — no prompts. We must still pass a kSecUseAuthenticationContext to
+    /// avoid Apple's "background credential" UI in some macOS versions.
+    static func readOwnCredentials() -> OAuthCredentials? {
+        let query: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: ownService,
+            kSecReturnData:  kCFBooleanTrue as Any,
+            kSecMatchLimit:  kSecMatchLimitOne,
+        ]
+        var raw: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &raw)
+        guard status == errSecSuccess, let data = raw as? Data else {
+            return nil
+        }
+        return try? JSONDecoder().decode(OAuthCredentials.self, from: data)
+    }
+
+    /// Writes credentials to ClaudeUsageBar's own keychain item.
+    /// Creates the item on first call. Throws only on unrecoverable Keychain errors.
+    @discardableResult
+    static func writeOwnCredentials(_ creds: OAuthCredentials) -> Bool {
+        let data: Data
+        do {
+            data = try JSONEncoder().encode(creds)
+        } catch {
+            NSLog("[ClaudeUsageBar] writeOwnCredentials: encode failed: %@", error.localizedDescription)
+            return false
+        }
+
+        // Try update first
+        let updateQuery: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: ownService,
+        ]
+        let attrs: [CFString: Any] = [kSecValueData: data]
+        let updateStatus = SecItemUpdate(updateQuery as CFDictionary, attrs as CFDictionary)
+
+        if updateStatus == errSecSuccess {
+            return true
+        }
+
+        if updateStatus == errSecItemNotFound {
+            // First write — add the item. The trusted apps list defaults to "just us".
+            let addQuery: [CFString: Any] = [
+                kSecClass:       kSecClassGenericPassword,
+                kSecAttrService: ownService,
+                kSecAttrAccount: "claudeUsageBar",
+                kSecValueData:   data,
+            ]
+            let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+            if addStatus == errSecSuccess {
+                NSLog("[ClaudeUsageBar] writeOwnCredentials: created own keychain item")
+                return true
+            }
+            NSLog("[ClaudeUsageBar] writeOwnCredentials: SecItemAdd failed: %d", Int(addStatus))
+            return false
+        }
+
+        NSLog("[ClaudeUsageBar] writeOwnCredentials: SecItemUpdate failed: %d", Int(updateStatus))
+        return false
+    }
+
+    /// Deletes ClaudeUsageBar's own keychain item (e.g. when its refresh token
+    /// has been invalidated and we need a clean re-bootstrap from Claude Code's item).
+    static func deleteOwnCredentials() {
+        let query: [CFString: Any] = [
+            kSecClass:       kSecClassGenericPassword,
+            kSecAttrService: ownService,
+        ]
+        SecItemDelete(query as CFDictionary)
     }
 }

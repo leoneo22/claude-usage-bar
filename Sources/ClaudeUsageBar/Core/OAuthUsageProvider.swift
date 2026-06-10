@@ -131,16 +131,24 @@ final class OAuthUsageProvider: ObservableObject {
 
         // If we're in a keychainDenied state, try a UI-allowed read first.
         // This is the only code path that shows a Keychain password dialog.
+        // Prefer own item (no prompt); fall back to Claude Code's only if needed.
         if case .keychainDenied = error {
-            do {
-                let creds = try KeychainManager.readClaudeCredentials(allowUI: true)
-                if !creds.isExpired {
-                    cachedToken = creds.accessToken
-                    cachedTokenExpiry = creds.expiresAt
-                    error = nil
+            if let creds = KeychainManager.readOwnCredentials(), !creds.isExpired {
+                cachedToken = creds.accessToken
+                cachedTokenExpiry = creds.expiresAt
+                error = nil
+            } else {
+                do {
+                    let creds = try KeychainManager.readClaudeCredentials(allowUI: true)
+                    if !creds.isExpired {
+                        KeychainManager.writeOwnCredentials(creds)
+                        cachedToken = creds.accessToken
+                        cachedTokenExpiry = creds.expiresAt
+                        error = nil
+                    }
+                } catch {
+                    // User denied again or other error — the poll will handle it
                 }
-            } catch {
-                // User denied again or other error — the poll will handle it
             }
         }
         poller.pollImmediately()
@@ -171,25 +179,40 @@ final class OAuthUsageProvider: ObservableObject {
     // MARK: - Token cache
 
     /// Returns a cached token or reads a fresh one from Keychain.
-    /// Only touches Keychain on first call, after expiry, or after invalidation.
-    /// Uses silent Keychain reads (no password dialog) for background polls.
+    ///
+    /// Lookup order:
+    ///   1. In-memory cache (no Keychain access)
+    ///   2. Own keychain item ("ClaudeUsageBar-OAuth") — silent, we own it, no prompts
+    ///   3. Claude Code's item ("Claude Code-credentials") — only on first ever run.
+    ///      This prompts once for "Always Allow". After we bootstrap, we immediately
+    ///      copy into our own item and never touch Claude Code's again.
     private func getToken() throws -> String {
         if let token = cachedToken,
            let expiry = cachedTokenExpiry,
            expiry > Date() {
             return token
         }
-        // allowUI: false → fail silently instead of showing a macOS password dialog.
-        // If the user hasn't granted "Always Allow", this will throw .accessDenied
-        // without interrupting the user. They can use "Poll Now" to trigger a read
-        // with UI allowed.
+
+        // 1. Try our own keychain item (silent — we own it, no ACL prompt)
+        if let creds = KeychainManager.readOwnCredentials() {
+            guard !creds.isExpired else {
+                throw UsageError.authExpired
+            }
+            cachedToken = creds.accessToken
+            cachedTokenExpiry = creds.expiresAt
+            return creds.accessToken
+        }
+
+        // 2. Bootstrap from Claude Code's item (one-time prompt → Always Allow).
+        //    We use allowUI: false here too — pollNow() with UI allowed is the only
+        //    code path that's permitted to show the prompt, to keep behaviour predictable.
         let creds = try KeychainManager.readClaudeCredentials(allowUI: false)
-        // If the Keychain token is already expired, throw immediately
-        // so the caller can trigger the refresh flow instead of making
-        // a doomed API call that returns 401.
         guard !creds.isExpired else {
             throw UsageError.authExpired
         }
+        // Immediately copy into our own item so we never touch Claude Code's again.
+        KeychainManager.writeOwnCredentials(creds)
+        NSLog("[ClaudeUsageBar] Bootstrapped credentials from Claude Code → own keychain item")
         cachedToken = creds.accessToken
         cachedTokenExpiry = creds.expiresAt
         return creds.accessToken
@@ -210,14 +233,8 @@ final class OAuthUsageProvider: ObservableObject {
     private func exportTokensToiCloud() {
         guard let token = cachedToken, let expiry = cachedTokenExpiry else { return }
 
-        // Read refresh token from Keychain for the export
-        let refreshToken: String?
-        do {
-            let creds = try KeychainManager.readClaudeCredentials(allowUI: false)
-            refreshToken = creds.refreshToken
-        } catch {
-            refreshToken = nil
-        }
+        // Read refresh token from our own keychain item (silent — we own it)
+        let refreshToken: String? = KeychainManager.readOwnCredentials()?.refreshToken
 
         let payload: [String: Any] = [
             "access_token": token,
