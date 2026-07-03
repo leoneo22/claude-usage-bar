@@ -35,16 +35,19 @@ struct PopoverView: View {
                             UsageCardView(title: "5-Hour Window", window: w)
                         }
                         if let w = provider.sevenDay {
-                            UsageCardView(title: "7-Day Window", window: w)
+                            UsageCardView(title: "Weekly", window: w)
                         }
                         if let w = provider.sevenDayOpus {
-                            UsageCardView(title: "7-Day Opus", window: w)
+                            UsageCardView(title: "Weekly Opus", window: w)
                         }
                         if let w = provider.sevenDaySonnet {
-                            UsageCardView(title: "7-Day Sonnet", window: w)
+                            UsageCardView(title: "Weekly Sonnet", window: w)
+                        }
+                        if let w = provider.sevenDayHaiku {
+                            UsageCardView(title: "Weekly Haiku", window: w)
                         }
                         if let w = provider.sevenDayCowork {
-                            UsageCardView(title: "7-Day Cowork", window: w)
+                            UsageCardView(title: "Weekly Cowork", window: w)
                         }
                         if let extra = provider.extraUsage, extra.isEnabled {
                             ExtraUsageCardView(extra: extra)

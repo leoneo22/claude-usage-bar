@@ -52,5 +52,9 @@ final class FloatingWindowController: NSObject, NSWindowDelegate {
     // NSWindowDelegate — clear reference when the window closes via its × button
     func windowWillClose(_ notification: Notification) {
         panel = nil
+        // Record state only for user closes, not app-quit teardown
+        if !AppState.isQuitting {
+            UserDefaults.standard.set(false, forKey: "floatingVisible")
+        }
     }
 }

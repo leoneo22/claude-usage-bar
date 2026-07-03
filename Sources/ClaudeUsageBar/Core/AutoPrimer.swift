@@ -1,5 +1,14 @@
 import Foundation
 
+/// Primer send failure carrying the HTTP status and API error message,
+/// so the popover shows "HTTP 404: model not found" instead of a generic
+/// "operation couldn't be completed" — makes model retirements diagnosable.
+struct PrimerSendError: Error, LocalizedError {
+    let status: Int
+    let detail: String
+    var errorDescription: String? { "HTTP \(status): \(detail)" }
+}
+
 /// Sends a tiny Haiku message shortly after detecting a 5-hour window reset,
 /// so the new window starts counting immediately rather than waiting
 /// for the user's next organic usage.
@@ -17,8 +26,11 @@ final class AutoPrimer: ObservableObject {
 
     // MARK: - Published state
 
-    @Published var isEnabled: Bool = true {
-        didSet { if !isEnabled { cancelScheduled() } }
+    @Published var isEnabled: Bool = UserDefaults.standard.object(forKey: "primerEnabled") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(isEnabled, forKey: "primerEnabled")
+            if !isEnabled { cancelScheduled() }
+        }
     }
     @Published private(set) var nextPrimeDate: Date?
     @Published private(set) var lastPrimed: Date?
@@ -254,7 +266,14 @@ final class AutoPrimer: ObservableObject {
         guard http.statusCode == 200 else {
             let responseBody = String(data: data, encoding: .utf8) ?? "(no body)"
             Self.log("API returned HTTP \(http.statusCode): \(responseBody)")
-            throw URLError(.badServerResponse)
+            // Extract the API's error message if the body is the standard error shape
+            var detail = String(responseBody.prefix(80))
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let err = json["error"] as? [String: Any],
+               let msg = err["message"] as? String {
+                detail = String(msg.prefix(80))
+            }
+            throw PrimerSendError(status: http.statusCode, detail: detail)
         }
     }
 }

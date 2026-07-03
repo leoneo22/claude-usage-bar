@@ -7,6 +7,7 @@ import Foundation
 ///
 /// **Rate-limit discipline:** At most one refresh per `minRefreshInterval`.
 /// If the endpoint returns 429, backs off for `rateLimitBackoff` before retrying.
+@MainActor
 enum TokenRefresher {
 
     // MARK: - Configuration
@@ -19,10 +20,10 @@ enum TokenRefresher {
     /// How long to wait after a 429 from the token endpoint.
     private static let rateLimitBackoff: TimeInterval = 600     // 10 minutes
 
-    // MARK: - State (accessed on @MainActor callers via async boundary)
+    // MARK: - State (@MainActor-isolated)
 
-    nonisolated(unsafe) private static var _lastRefreshAttempt: Date?
-    nonisolated(unsafe) private static var _rateLimitedUntil: Date?
+    private static var _lastRefreshAttempt: Date?
+    private static var _rateLimitedUntil: Date?
 
     // MARK: - Public API
 
@@ -115,7 +116,7 @@ enum TokenRefresher {
 
         guard cli.refreshToken != failedRefreshToken else {
             NSLog("[ClaudeUsageBar] Re-bootstrap aborted — Claude Code has the same revoked token. Run `claude` in Terminal to re-authenticate.")
-            return nil
+            throw UsageError.reauthRequired
         }
 
         // Claude Code has newer credentials — replace our own item with them
@@ -132,7 +133,7 @@ enum TokenRefresher {
         let result = try await callTokenEndpoint(refreshToken: cli.refreshToken)
         guard case .success(let response) = result else {
             NSLog("[ClaudeUsageBar] Re-bootstrap refresh also failed. Run `claude` in Terminal to re-authenticate.")
-            return nil
+            throw UsageError.reauthRequired
         }
         let creds = OAuthCredentials(
             accessToken: response.accessToken,

@@ -3,6 +3,13 @@ import SwiftUI
 import Combine
 import ServiceManagement
 
+/// Set during quit so window controllers don't record teardown-closes
+/// as "user closed the window" (which would break state restore).
+@MainActor
+enum AppState {
+    static var isQuitting = false
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
@@ -26,6 +33,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupPopover()
         observeProvider()
         provider.startPolling()
+        restoreWindowState()
+    }
+
+    /// Reopens the desktop widget / floating window if they were visible at last quit.
+    private func restoreWindowState() {
+        if UserDefaults.standard.bool(forKey: "widgetVisible") {
+            widgetWindow.show(provider: provider)
+        }
+        if UserDefaults.standard.bool(forKey: "floatingVisible") {
+            floatingWindow.show(provider: provider)
+        }
     }
 
     // MARK: - Status item
@@ -85,32 +103,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func detachToFloatingWindow() {
         popover?.performClose(nil)
         floatingWindow.show(provider: provider)
+        UserDefaults.standard.set(true, forKey: "floatingVisible")
     }
 
     // MARK: - Observation
 
     private func observeProvider() {
-        provider.$fiveHour
+        // One observer for all state — fires after any @Published change lands
+        provider.objectWillChange
             .receive(on: RunLoop.main)
-            .sink { [weak self] window in
-                guard let window else { return }
-                let pct = Int(window.utilization.rounded())
-                self?.statusItem?.button?.title = "⚡ \(pct)%"
+            .sink { [weak self] _ in
+                self?.updateStatusTitle()
             }
             .store(in: &cancellables)
+    }
 
-        provider.$error
-            .receive(on: RunLoop.main)
-            .sink { [weak self] error in
-                guard error != nil else { return }
-                switch error {
-                case .authExpired, .keychainDenied:
-                    self?.statusItem?.button?.title = "⚡ ⚠"
-                default:
-                    break
-                }
-            }
-            .store(in: &cancellables)
+    /// Menu bar shows the 5-hour %, plus a warning with the worst weekly window
+    /// when any weekly limit is running hot (≥ 80%) — prevents surprise lockouts
+    /// when the 5-hour window looks fine but a weekly cap is nearly exhausted.
+    private func updateStatusTitle() {
+        switch provider.error {
+        case .authExpired, .keychainDenied, .reauthRequired:
+            statusItem?.button?.title = "⚡ ⚠"
+            return
+        default:
+            break
+        }
+
+        guard let five = provider.fiveHour else { return }
+        let pct = Int(five.utilization.rounded())
+
+        let weeklies = [provider.sevenDay, provider.sevenDayOpus, provider.sevenDaySonnet,
+                        provider.sevenDayHaiku, provider.sevenDayCowork]
+            .compactMap { $0?.utilization }
+        if let worst = weeklies.max(), worst >= 80 {
+            statusItem?.button?.title = "⚡ \(pct)% ⚠\(Int(worst.rounded()))%"
+        } else {
+            statusItem?.button?.title = "⚡ \(pct)%"
+        }
     }
 
     // MARK: - Menu
@@ -159,6 +189,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func toggleWidget() {
         widgetWindow.toggle(provider: provider)
+        UserDefaults.standard.set(widgetWindow.isVisible, forKey: "widgetVisible")
     }
 
     @objc private func moveWidgetHere() {
@@ -190,6 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func quit() {
+        AppState.isQuitting = true
         provider.stopPolling()
         NSApplication.shared.terminate(nil)
     }

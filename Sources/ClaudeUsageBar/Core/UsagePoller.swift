@@ -113,6 +113,9 @@ final class UsagePoller {
             return Interval.rateLimitBackoff(consecutiveErrors: consecutiveErrors)
         case .keychainDenied:
             return Interval.keychainDenied
+        case .reauthRequired:
+            // Only a human login fixes this — poll slowly, recover on next success
+            return Interval.keychainDenied
         case .some:
             return consecutiveErrors >= 3 ? Interval.backoff : Interval.afterError
         case .none:

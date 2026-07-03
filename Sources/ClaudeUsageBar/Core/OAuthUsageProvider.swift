@@ -13,6 +13,7 @@ final class OAuthUsageProvider: ObservableObject {
     @Published private(set) var sevenDay: UsageWindow?
     @Published private(set) var sevenDayOpus: UsageWindow?
     @Published private(set) var sevenDaySonnet: UsageWindow?
+    @Published private(set) var sevenDayHaiku: UsageWindow?
     @Published private(set) var sevenDayCowork: UsageWindow?
     @Published private(set) var extraUsage: ExtraUsage?
     @Published private(set) var lastUpdated: Date?
@@ -57,7 +58,14 @@ final class OAuthUsageProvider: ObservableObject {
 
     // MARK: - Polling
 
+    /// Guards against overlapping polls (e.g. "Poll Now" clicked mid-poll) —
+    /// the usage endpoint is strictly rate limited, so never double-fire.
+    private var isPolling = false
+
     func poll() async {
+        guard !isPolling else { return }
+        isPolling = true
+        defer { isPolling = false }
         do {
             let token = try getToken()
             let response = try await fetchUsage(using: token)
@@ -161,14 +169,12 @@ final class OAuthUsageProvider: ObservableObject {
         sevenDay = response.sevenDay
         sevenDayOpus = response.sevenDayOpus
         sevenDaySonnet = response.sevenDaySonnet
+        sevenDayHaiku = response.sevenDayHaiku
         sevenDayCowork = response.sevenDayCowork
         extraUsage = response.extraUsage
         lastUpdated = Date()
         error = nil
         autoPrimer.handleUpdate(response.fiveHour)
-
-        // Export current tokens to iCloud Drive for the iOS phone-based primer
-        exportTokensToiCloud()
     }
 
     private func setError(_ e: UsageError) {
@@ -221,41 +227,6 @@ final class OAuthUsageProvider: ObservableObject {
     private func invalidateTokenCache() {
         cachedToken = nil
         cachedTokenExpiry = nil
-    }
-
-    // MARK: - iCloud token export (for iOS phone-based primer)
-
-    /// Exports the current access + refresh token to iCloud Drive so the iOS Shortcut
-    /// can read them and fire primer messages overnight.
-    ///
-    /// File: ~/Library/Mobile Documents/com~apple~CloudDocs/ClaudePrimer/token.json
-    /// Syncs automatically to the user's iPhone via iCloud Drive.
-    private func exportTokensToiCloud() {
-        guard let token = cachedToken, let expiry = cachedTokenExpiry else { return }
-
-        // Read refresh token from our own keychain item (silent — we own it)
-        let refreshToken: String? = KeychainManager.readOwnCredentials()?.refreshToken
-
-        let payload: [String: Any] = [
-            "access_token": token,
-            "refresh_token": refreshToken ?? "",
-            "expires_at": expiry.timeIntervalSince1970,
-            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-            "updated_at": ISO8601DateFormatter().string(from: Date()),
-        ]
-
-        let fm = FileManager.default
-        let iCloudDir = fm.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Mobile Documents/com~apple~CloudDocs/ClaudePrimer")
-
-        do {
-            try fm.createDirectory(at: iCloudDir, withIntermediateDirectories: true)
-            let file = iCloudDir.appendingPathComponent("token.json")
-            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
-            try data.write(to: file, options: .atomic)
-        } catch {
-            // Non-critical — don't log noise if iCloud Drive isn't set up
-        }
     }
 
     /// Debug logging for API issues — writes to NSLog only (no disk file).

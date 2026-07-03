@@ -39,6 +39,7 @@ struct UsageResponse: Decodable, Sendable {
     let sevenDay: UsageWindow?
     let sevenDayOpus: UsageWindow?
     let sevenDaySonnet: UsageWindow?
+    let sevenDayHaiku: UsageWindow?
     let sevenDayCowork: UsageWindow?
     let extraUsage: ExtraUsage?
 
@@ -47,6 +48,7 @@ struct UsageResponse: Decodable, Sendable {
         case sevenDay        = "seven_day"
         case sevenDayOpus    = "seven_day_opus"
         case sevenDaySonnet  = "seven_day_sonnet"
+        case sevenDayHaiku   = "seven_day_haiku"
         case sevenDayCowork  = "seven_day_cowork"
         case extraUsage      = "extra_usage"
     }
@@ -56,6 +58,9 @@ struct UsageResponse: Decodable, Sendable {
 
 enum UsageError: Error, LocalizedError, Sendable {
     case authExpired
+    /// Refresh token revoked AND no recoverable credentials anywhere —
+    /// only a human logging in can fix this.
+    case reauthRequired
     case keychainDenied
     /// Rate limited with optional Retry-After value (in seconds) from the API.
     case rateLimited(retryAfter: Double?)
@@ -67,6 +72,8 @@ enum UsageError: Error, LocalizedError, Sendable {
         switch self {
         case .authExpired:
             return "Auth expired — re-authenticating…"
+        case .reauthRequired:
+            return "Login expired — run `claude` in Terminal, then /login"
         case .keychainDenied:
             return "Keychain access denied — click \"Always Allow\" when prompted, or right-click → Poll Now"
         case .rateLimited(let retryAfter):
@@ -104,6 +111,7 @@ extension UsageError: Equatable {
     static func == (lhs: UsageError, rhs: UsageError) -> Bool {
         switch (lhs, rhs) {
         case (.authExpired, .authExpired): return true
+        case (.reauthRequired, .reauthRequired): return true
         case (.keychainDenied, .keychainDenied): return true
         case (.rateLimited, .rateLimited): return true
         case (.httpError(let a), .httpError(let b)): return a == b

@@ -82,6 +82,9 @@ final class WidgetWindowController: NSObject, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         panel = nil
+        if !AppState.isQuitting {
+            UserDefaults.standard.set(false, forKey: "widgetVisible")
+        }
     }
 }
 
