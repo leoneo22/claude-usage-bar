@@ -1,6 +1,6 @@
 # ClaudeUsageBar
 
-A native macOS menu bar app that shows your Claude API usage at a glance.
+A native macOS menu bar app that shows your Claude usage at a glance.
 
 ```
 ⚡ 62%
@@ -14,13 +14,15 @@ Left-click the icon to open a live popup with progress bars and a reset countdow
 
 ## Features
 
-- **Menu bar icon** — live `⚡` with utilization percentage, turns `⚠` on errors
-- **Usage popover** — 5-hour window, 7-day windows (Opus, Sonnet, Cowork), extra usage credits
+- **Menu bar icon** — live `⚡` with 5-hour utilization; appends `⚠ N%` when any weekly limit is running hot (≥ 80%); turns `⚡ ⚠` on auth errors
+- **Usage popover** — 5-hour window, weekly windows (overall, Opus, Sonnet, Haiku, Cowork), extra usage credits
 - **Desktop widget** — compact floating bar showing just the 5-hour card, always-on-top, draggable
 - **Detachable window** — pin the popover as a floating always-on-top window
-- **Auto-Primer** — automatically primes your usage window 55 min after reset
+- **Auto-Primer** — sends a 1-token message seconds after your 5-hour window resets, so the fresh window starts counting immediately (with a gas-station ding when it fires)
+- **Window state restore** — widget and floating window reopen where you left them after relaunch
 - **Start at Login** — native macOS `SMAppService` integration
-- **Smart polling** — 60s normal, 30s on errors, 5m backoff, instant on wake from sleep
+- **Zero password prompts** — owns its own Keychain item; asks for access exactly once, ever
+- **Smart polling** — 3 min normal, faster on errors, exponential backoff on rate limits, instant on wake from sleep
 - **Multi-monitor** — widget positions to the screen your cursor is on
 
 ---
@@ -64,7 +66,7 @@ open /Applications/ClaudeUsageBar.app
 
 The `⚡` icon appears in your menu bar immediately.
 
-> **Keychain prompt:** The first time you launch, macOS will ask if ClaudeUsageBar can access the "Claude Code-credentials" Keychain item. Click **Always Allow** so it doesn't ask again.
+> **One-time Keychain prompt:** On first launch, macOS asks if ClaudeUsageBar can read the "Claude Code-credentials" Keychain item. Click **Always Allow**. The app copies the credentials into its own Keychain item and never touches Claude Code's again — so this prompt happens once, not on every poll or rebuild.
 
 ---
 
@@ -80,13 +82,17 @@ The `⚡` icon appears in your menu bar immediately.
 ### Popup contents
 
 - **5-Hour Window** — rolling 5-hour utilization with a live countdown to reset
-- **7-Day Window** — rolling 7-day utilization (when active)
-- **7-Day Opus / Sonnet / Cowork** — per-model 7-day windows (when active)
+- **Weekly** — rolling 7-day utilization (when active)
+- **Weekly Opus / Sonnet / Haiku / Cowork** — per-model weekly windows (when active)
 - **Extra Usage** — credits used vs monthly limit (when enabled)
-- **Auto-Primer toggle** — enable/disable automatic priming
+- **Auto-Primer toggle** — enable/disable automatic priming (persists across restarts)
 - **Footer** — last update time + manual refresh button
 
 Progress bar colors: green (< 50%), yellow (50–80%), red (> 80%).
+
+### Menu bar warning
+
+The icon normally shows your 5-hour window: `⚡ 12%`. If any *weekly* window reaches 80%, it appends the worst one — `⚡ 12% ⚠91%` — so a nearly-exhausted weekly cap can't sneak up on you while the 5-hour number looks healthy.
 
 ### Context menu (right-click)
 
@@ -94,6 +100,7 @@ Progress bar colors: green (< 50%), yellow (50–80%), red (> 80%).
 |---|---|
 | **Poll Now** | Fetch usage immediately |
 | **Auto-Primer** | Toggle auto-primer on/off (checkmark = on) |
+| **Test Primer Now** | Fire a primer message immediately |
 | **Desktop Widget** | Toggle compact floating usage bar |
 | **Move Widget Here** | Reposition widget to current screen |
 | **Start at Login** | Launch at login via macOS ServiceManagement |
@@ -109,12 +116,15 @@ A compact borderless bar showing just the 5-hour usage card. Enable it from the 
 - **Draggable** — click and drag to reposition
 - **All spaces** — visible on every desktop/space
 - **Multi-monitor** — "Move Widget Here" repositions to your cursor's screen
+- **Remembered** — if it was open when you quit, it reopens on next launch
 
 ---
 
 ## Auto-Primer
 
-When your 5-hour window resets, you have a fresh quota — but it doesn't start counting until your first message. Auto-Primer detects the reset and, 55 minutes later, sends a single `hi` to `claude-haiku-4-5-20251001` with `max_tokens: 1` to "prime" the window so the countdown starts.
+When your 5-hour window resets, the fresh quota doesn't start counting down until your first message. Auto-Primer detects the reset (two ways: the reset timestamp jumping forward, or an idle window at < 2% utilization) and about 10 seconds later sends a single `hi` to Haiku with `max_tokens: 1` — priming the window so the countdown starts immediately.
+
+When it fires, you'll hear a synthesized gas-station "ding-ding" (respects system mute).
 
 **Cost:** ~3 input tokens per fire — negligible.
 
@@ -124,21 +134,27 @@ When your 5-hour window resets, you have a fresh quota — but it doesn't start 
 
 | Condition | Interval |
 |---|---|
-| Normal | Every 60 seconds |
-| After an error | Every 30 seconds |
-| 3+ consecutive errors | Every 5 minutes (backoff) |
-| Rate limited (429) | 5 minutes |
-| Mac wakes from sleep | Immediately |
+| Normal | Every 3 minutes |
+| After an error | Every 60 seconds |
+| 3+ consecutive errors | Every 5 minutes |
+| Rate limited (429) | Exponential: 2 → 4 → 8 → 10 min cap (respects `Retry-After`) |
+| Keychain access denied | Every 10 minutes |
+| Login expired (re-auth needed) | Every 10 minutes |
+| Mac wakes from sleep | After 5 seconds |
+
+"Poll Now" always fires immediately and resets all backoffs.
 
 ---
 
-## Code signing & Keychain
+## How Keychain access works
 
-The build script auto-detects your code signing identity. If you have an Apple Development certificate, it uses that — giving the app a stable identity so Keychain remembers "Always Allow" across rebuilds.
+ClaudeUsageBar maintains its **own** Keychain item (`ClaudeUsageBar-OAuth`):
 
-If no signing identity is found, it falls back to ad-hoc signing (you may need to re-authorize Keychain access after each rebuild).
+1. **First launch:** reads Claude Code's item once (the single "Always Allow" prompt), copies the credentials into its own item.
+2. **Everything after:** reads, writes, and token refreshes use only its own item. Owning the item means the app is on its trusted-apps list — no prompts, ever, including across rebuilds.
+3. **Self-healing:** if the stored refresh token gets revoked (e.g. you re-log-in to Claude elsewhere), the app automatically re-bootstraps from Claude Code's item. If Claude Code's copy is also dead, the popup tells you exactly what to do (`claude` → `/login`).
 
-To check your signing identities:
+The build script signs with your Apple Development certificate when available, giving the app a stable code-signing identity so Keychain trust survives rebuilds. Check yours with:
 
 ```bash
 security find-identity -v -p codesigning
@@ -159,23 +175,27 @@ cp -R ClaudeUsageBar.app /Applications/
 open /Applications/ClaudeUsageBar.app
 ```
 
+No Keychain re-authorization needed — the app's own item survives rebuilds.
+
 ---
 
 ## Troubleshooting
 
 ### `⚡ ⚠` in the menu bar
 
-Your OAuth token expired and couldn't be refreshed automatically. Run `claude` in Terminal to re-authenticate, then use **Poll Now** from the right-click menu.
+Left-click the icon — the banner at the top of the popup says exactly what's wrong:
+
+- **"Login expired — run `claude` in Terminal, then /login"** — your refresh token was revoked (usually because you logged in again on another device or app). Open Terminal, run `claude`, type `/login`, complete the browser flow. The app recovers automatically within minutes (or right-click → Poll Now to skip the wait).
+- **"Auth expired — re-authenticating…"** — transient; the app is refreshing its token. If it persists, treat it as login-expired above.
+- **"Keychain access denied"** — right-click → Poll Now and click **Always Allow** on the prompt.
 
 ### "Claude Code credentials not found"
 
 Claude Code is not authenticated on this machine. Run `claude` in Terminal and complete the login flow, then relaunch the app.
 
-### Keychain prompt keeps appearing
+### Primer shows "❌ HTTP 404: …"
 
-If you don't have an Apple Development certificate, each rebuild changes the code signature. Either:
-- Create a free signing identity via Xcode (Xcode → Settings → Accounts → Manage Certificates)
-- Or open **Keychain Access**, find "Claude Code-credentials", and add `ClaudeUsageBar` to its **Access Control** list
+The primer's hardcoded model was retired. Update the model ID in `Sources/ClaudeUsageBar/Core/AutoPrimer.swift` and rebuild.
 
 ### App doesn't appear in menu bar
 
@@ -200,20 +220,22 @@ claude-usage-bar/
 │   └── AppIcon.icns
 └── Sources/ClaudeUsageBar/
     ├── App/
-    │   ├── ClaudeUsageBarApp.swift         # @main entry point
-    │   ├── AppDelegate.swift               # NSStatusItem, popover, menus
+    │   ├── ClaudeUsageBarApp.swift          # @main entry point
+    │   ├── AppDelegate.swift                # NSStatusItem, popover, menus
     │   ├── FloatingWindowController.swift   # Detached popover window
     │   └── WidgetWindowController.swift     # Compact desktop widget
     ├── Core/
     │   ├── OAuthUsageProvider.swift         # Main data provider + API calls
     │   ├── UsagePoller.swift                # Timer + backoff logic
-    │   ├── TokenRefresher.swift             # 401 recovery
-    │   ├── AutoPrimer.swift                 # 55-min window priming
-    │   ├── KeychainManager.swift            # Reads Claude Code token
+    │   ├── TokenRefresher.swift             # OAuth refresh + self-healing re-bootstrap
+    │   ├── AutoPrimer.swift                 # Window priming after reset
+    │   ├── KeychainManager.swift            # Own item + one-time Claude Code bootstrap
     │   └── UsageProvider.swift              # Protocol
     ├── Models/
     │   ├── OAuthCredentials.swift
     │   └── UsageData.swift
+    ├── Utilities/
+    │   └── FuelGaugeBell.swift              # Synthesized gas-station bell
     └── Views/
         ├── PopoverView.swift
         ├── UsageCardView.swift              # + ExtraUsageCardView
