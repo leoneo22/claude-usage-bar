@@ -49,14 +49,21 @@ enum TokenRefresher {
 
         _lastRefreshAttempt = Date()
 
-        // Read current refresh_token from our own item (silent), with a one-time
-        // fallback to Claude Code's item if we haven't bootstrapped yet.
+        // Read current refresh_token from our own item (silent), with a fallback to
+        // Claude Code's item. readOwnCredentials returns nil for blank-token items,
+        // so an empty token can never reach the endpoint.
         let currentRefreshToken: String
         if let own = KeychainManager.readOwnCredentials() {
             currentRefreshToken = own.refreshToken
         } else {
             let bootstrap = try KeychainManager.readClaudeCredentials(allowUI: false)
             currentRefreshToken = bootstrap.refreshToken
+            KeychainManager.writeOwnCredentials(bootstrap)
+            // Claude Code's token may already be usable — skip a pointless refresh
+            if bootstrap.isUsable {
+                NSLog("[ClaudeUsageBar] Recovered usable credentials from Claude Code")
+                return bootstrap
+            }
         }
 
         NSLog("[ClaudeUsageBar] Attempting OAuth token refresh...")
@@ -88,13 +95,15 @@ enum TokenRefresher {
 
         case .error(let message):
             NSLog("[ClaudeUsageBar] Token refresh failed: %@", message)
-            // invalid_grant = our stored refresh token has been revoked (e.g. the
-            // claude CLI rotated it). Claude Code's keychain item likely holds fresh
-            // credentials — re-bootstrap from it instead of failing forever.
-            if message.contains("invalid_grant") {
-                return try await rebootstrapFromClaudeCode(failedRefreshToken: currentRefreshToken)
-            }
-            return nil
+            // ANY refresh failure means our stored token can't be used: revoked
+            // (invalid_grant), malformed (invalid_request_error), or otherwise
+            // rejected. Claude Code's item may hold working credentials, so always
+            // try to recover from it rather than failing permanently.
+            //
+            // Scoping this to invalid_grant is exactly what left the app dead from
+            // 2026-08-03: a blank stored token produced invalid_request_error, which
+            // fell through this branch and never recovered.
+            return try await rebootstrapFromClaudeCode(failedRefreshToken: currentRefreshToken)
         }
     }
 
@@ -119,7 +128,9 @@ enum TokenRefresher {
             throw UsageError.reauthRequired
         }
 
-        // Claude Code has newer credentials — replace our own item with them
+        // Claude Code has different credentials — adopt them.
+        // writeOwnCredentials refuses blank tokens, and readClaudeCredentials
+        // already rejected them, so we can't re-poison our item here.
         KeychainManager.deleteOwnCredentials()
         KeychainManager.writeOwnCredentials(cli)
 

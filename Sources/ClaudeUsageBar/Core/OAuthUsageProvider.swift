@@ -79,6 +79,10 @@ final class OAuthUsageProvider: ObservableObject {
             // Retrying would immediately pop another password dialog.
             NSLog("[ClaudeUsageBar] Keychain access denied — backing off to avoid repeated prompts")
             setError(.keychainDenied)
+        } catch KeychainError.emptyTokens {
+            // Claude Code is mid-write; its next write should have real tokens.
+            NSLog("[ClaudeUsageBar] Credentials temporarily empty — will retry")
+            setError(.authExpired)
         } catch let e as KeychainError {
             // Other Keychain errors (not found, bad data) — try refresh flow
             NSLog("[ClaudeUsageBar] Keychain error: %@", e.localizedDescription)
@@ -199,7 +203,8 @@ final class OAuthUsageProvider: ObservableObject {
             return token
         }
 
-        // 1. Try our own keychain item (silent — we own it, no ACL prompt)
+        // 1. Try our own keychain item (silent — we own it, no ACL prompt).
+        //    Returns nil if the item is missing or holds blank tokens.
         if let creds = KeychainManager.readOwnCredentials() {
             guard !creds.isExpired else {
                 throw UsageError.authExpired

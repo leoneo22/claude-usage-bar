@@ -7,6 +7,9 @@ import LocalAuthentication
 enum KeychainError: Error, LocalizedError {
     case notFound
     case accessDenied
+    /// Stored credentials exist but contain blank tokens — transient state while
+    /// Claude Code rewrites its blob. Retry shortly; never persist these.
+    case emptyTokens
     case unexpectedData(String)
     case osError(OSStatus)
 
@@ -16,6 +19,8 @@ enum KeychainError: Error, LocalizedError {
             return "Claude Code credentials not found. Run `claude` in Terminal to authenticate."
         case .accessDenied:
             return "Keychain access denied. Click \"Always Allow\" when prompted to stop repeated password requests."
+        case .emptyTokens:
+            return "Claude Code credentials are empty — waiting for it to finish writing."
         case .unexpectedData(let detail):
             return "Credential format unrecognised: \(detail)"
         case .osError(let status):
@@ -99,17 +104,25 @@ enum KeychainManager {
             throw KeychainError.unexpectedData("SecItemCopyMatching did not return Data")
         }
 
+        let creds: OAuthCredentials
         do {
             // Claude Code wraps credentials under a "claudeAiOauth" key
             if let wrapper = try? JSONDecoder().decode([String: OAuthCredentials].self, from: data),
-               let creds = wrapper["claudeAiOauth"] {
-                return creds
+               let wrapped = wrapper["claudeAiOauth"] {
+                creds = wrapped
+            } else {
+                // Fallback: top-level object (older Claude Code versions)
+                creds = try JSONDecoder().decode(OAuthCredentials.self, from: data)
             }
-            // Fallback: top-level object (older Claude Code versions)
-            return try JSONDecoder().decode(OAuthCredentials.self, from: data)
         } catch {
             throw KeychainError.unexpectedData(error.localizedDescription)
         }
+
+        // Claude Code sometimes writes blank tokens transiently. Never propagate them.
+        guard creds.hasTokens else {
+            throw KeychainError.emptyTokens
+        }
+        return creds
     }
 
     /// Writes refreshed credentials back to Keychain in the format Claude Code expects.
@@ -208,13 +221,28 @@ enum KeychainManager {
         guard status == errSecSuccess, let data = raw as? Data else {
             return nil
         }
-        return try? JSONDecoder().decode(OAuthCredentials.self, from: data)
+        guard let creds = try? JSONDecoder().decode(OAuthCredentials.self, from: data) else {
+            return nil
+        }
+        // A stored item with blank tokens is unusable and unrecoverable — treat it
+        // as absent so callers re-bootstrap from Claude Code instead of looping.
+        guard creds.hasTokens else {
+            NSLog("[ClaudeUsageBar] Own keychain item has empty tokens — discarding")
+            deleteOwnCredentials()
+            return nil
+        }
+        return creds
     }
 
     /// Writes credentials to ClaudeUsageBar's own keychain item.
     /// Creates the item on first call. Throws only on unrecoverable Keychain errors.
     @discardableResult
     static func writeOwnCredentials(_ creds: OAuthCredentials) -> Bool {
+        // Never persist blank tokens — doing so is what broke the app on 2026-08-03.
+        guard creds.hasTokens else {
+            NSLog("[ClaudeUsageBar] writeOwnCredentials: refused — credentials have empty tokens")
+            return false
+        }
         let data: Data
         do {
             data = try JSONEncoder().encode(creds)

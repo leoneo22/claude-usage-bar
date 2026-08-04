@@ -49,6 +49,21 @@ struct OAuthCredentials: Codable, Sendable {
 
     var isExpired: Bool { expiresAt <= Date() }
 
+    /// True when both tokens actually contain a value.
+    ///
+    /// Claude Code can transiently store empty-string tokens (observed 2026-08-03,
+    /// e.g. while re-writing its credential blob). Copying those into our own item
+    /// poisons it permanently: an empty refresh_token makes the token endpoint
+    /// return `invalid_request_error`, not `invalid_grant`, so recovery never fires.
+    /// Never store or use credentials that fail this check.
+    var hasTokens: Bool {
+        !accessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !refreshToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    /// Usable right now: real tokens and not past expiry.
+    var isUsable: Bool { hasTokens && !isExpired }
+
     /// Encode to a stable camelCase shape with ms timestamps (matches Claude Code's format).
     func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: AnyKey.self)
